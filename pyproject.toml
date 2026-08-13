@@ -55,4 +55,4 @@ include-package-data = true
 include = ["samatch*"]
 
 [tool.setuptools.package-data]
-sam = ["data/*.csv"]
+samatch = ["data/*.csv"]
