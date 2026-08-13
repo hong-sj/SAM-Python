@@ -11,6 +11,8 @@ The package also provides matching diagnostics, matched-cohort outcome
 analysis, three-way propensity score matching, and multi-arm weighting.
 """
 
+from importlib.metadata import version
+
 from ._candidate_search import gps_candidate_search
 from ._diagnostics import (
     compute_pairwise_treatment_auc,
@@ -38,8 +40,11 @@ from ._weighting import (
 )
 from .datasets import load_sample_3group, load_sample_4group
 
+__version__ = version("sam-shared-anchor-matching")
 
 __all__ = [
+    # Package metadata
+    "__version__",
     # Generalized propensity scores and matching
     "estimate_gps_multinom",
     "gps_candidate_search",
