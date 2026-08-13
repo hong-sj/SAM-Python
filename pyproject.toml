@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam-shared-anchor-matching"
+version = "0.1.0"
+description = "Shared Anchor Matching: a scalable matching framework for multiple treatment groups."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+
+authors = [
+    { name = "Sungjun Hong", email = "hsj2864@gmail.com" },
+]
+
+keywords = [
+    "propensity score",
+    "matching",
+    "causal inference",
+    "multiple treatments",
+    "observational study",
+    "generalized propensity score",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "scipy>=1.9",
+    "scikit-learn>=1.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/hong-sj/SAM-Python"
+Repository = "https://github.com/hong-sj/SAM-Python"
+Issues = "https://github.com/hong-sj/SAM-Python/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["samatch*"]
+
+[tool.setuptools.package-data]
+sam = ["data/*.csv"]
