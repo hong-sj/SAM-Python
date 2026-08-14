@@ -439,12 +439,20 @@ def _cluster_robust_vcov(fit, cluster):
         bread = np.linalg.pinv(xtwx)
 
     score_i = X * (y - mu)[:, None]
-    unique_clusters = pd.unique(cluster)
 
-    score_cluster = np.vstack(
+    # Accumulate per-cluster scores with a scatter-add. Masking the full score
+    # matrix once per cluster would be quadratic here, since SAM produces one
+    # matched set per anchor and so the cluster count grows with the sample.
+    codes, unique_clusters = pd.factorize(cluster)
+
+    score_cluster = np.column_stack(
         [
-            score_i[cluster == cluster_id].sum(axis=0)
-            for cluster_id in unique_clusters
+            np.bincount(
+                codes,
+                weights=score_i[:, column],
+                minlength=len(unique_clusters),
+            )
+            for column in range(X.shape[1])
         ]
     )
 

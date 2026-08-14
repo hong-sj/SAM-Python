@@ -147,8 +147,28 @@ def sam_match(
     version = np.zeros(n_anchor, dtype=np.int64)
     heap = []
 
+    # Reverse index: which anchors currently have their best match pointing at
+    # a given comparator subject. Without it, consuming a subject would mean
+    # rescanning every remaining anchor to find the few that were relying on
+    # it, which is quadratic in the anchor count.
+    claimants = {
+        group: [set() for _ in range(len(group_rows[group]))]
+        for group in groups
+    }
+
+    def release(i):
+        """Drop anchor `i`'s outstanding claims on comparator subjects."""
+        for group in groups:
+            chosen = int(best_choice[group][i])
+
+            if chosen >= 0:
+                claimants[group][chosen].discard(i)
+                best_choice[group][i] = -1
+
     def recompute(i):
         """Recompute the current best available match for one anchor."""
+        release(i)
+
         total_loss = 0.0
 
         for group in groups:
@@ -165,16 +185,19 @@ def sam_match(
             pointer[group][i] = position
 
             if position >= len(local_indices):
+                release(i)
                 best_loss[i] = np.inf
 
                 for other_group in groups:
-                    best_choice[other_group][i] = -1
                     best_distance[other_group][i] = np.nan
 
                 version[i] += 1
                 return
 
-            best_choice[group][i] = int(local_indices[position])
+            chosen = int(local_indices[position])
+
+            best_choice[group][i] = chosen
+            claimants[group][chosen].add(i)
             best_distance[group][i] = float(distances[position])
             total_loss += float(distances[position])
 
@@ -235,22 +258,24 @@ def sam_match(
         anchor_active[anchor_idx] = False
         n_active_anchor -= 1
 
+        affected = set()
+
         for group in groups:
             active[group][choice[group]] = False
+            affected |= claimants[group][choice[group]]
+
+        release(anchor_idx)
+        affected.discard(anchor_idx)
 
         if n_active_anchor == 0:
             break
 
         # Only anchors using one of the newly assigned comparator subjects
-        # need to have their current best match recomputed.
-        remaining_anchors = np.flatnonzero(anchor_active)
-
-        for i in remaining_anchors:
-            if any(
-                int(best_choice[group][i]) == choice[group]
-                for group in groups
-            ):
-                recompute(int(i))
+        # need to have their current best match recomputed. Sorting keeps the
+        # order independent of set iteration order.
+        for i in sorted(affected):
+            if anchor_active[i]:
+                recompute(i)
 
     if matched_rows:
         matched = pd.DataFrame(matched_rows)
