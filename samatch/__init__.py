@@ -11,7 +11,7 @@ The package also provides matching diagnostics, matched-cohort outcome
 analysis, three-way propensity score matching, and multi-arm weighting.
 """
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 from ._candidate_search import gps_candidate_search
 from ._diagnostics import (
@@ -40,7 +40,10 @@ from ._weighting import (
 )
 from .datasets import load_sample_3group, load_sample_4group
 
-__version__ = version("sam-shared-anchor-matching")
+try:
+    __version__ = version("samatch")
+except PackageNotFoundError:  # running from a source checkout
+    __version__ = "0.1.1"
 
 __all__ = [
     # Package metadata
