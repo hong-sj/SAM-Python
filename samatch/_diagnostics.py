@@ -41,6 +41,12 @@ def compute_smd_balance(data, matched, X_vars=None, groups=None):
           group, plus ``n_undefined``, the number of covariates that could
           not be assessed. Undefined covariates are excluded from the mean
           and maximum rather than propagating a NaN.
+
+    Notes
+    -----
+    A match that formed no sets has nothing to balance. It is reported as
+    zero rows in ``by_covariate`` and an empty ``summary`` rather than as
+    covariates that could not be assessed, which is a different finding.
     """
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
@@ -49,6 +55,22 @@ def compute_smd_balance(data, matched, X_vars=None, groups=None):
         groups = groups_from_matched(matched)
 
     rows = []
+
+    if len(matched) == 0:
+        return {
+            "by_covariate": pd.DataFrame(
+                columns=["group", "covariate", "smd", "smd_defined"]
+            ).astype({"smd": "float64", "smd_defined": "bool"}),
+            "summary": pd.DataFrame(
+                columns=["group", "mean_abs_smd", "max_abs_smd", "n_undefined"]
+            ).astype(
+                {
+                    "mean_abs_smd": "float64",
+                    "max_abs_smd": "float64",
+                    "n_undefined": "int64",
+                }
+            ),
+        }
 
     x_anchor = data.iloc[matched["anchor"].to_numpy()][X_vars]
 
@@ -143,12 +165,23 @@ def compute_pairwise_treatment_auc(gps, matched, groups=None, anchor_level=None)
     Subjects are scored with the GPS model as fitted, on the same subjects it
     was fitted to. The reported AUC therefore measures residual separation
     after matching, not held-out discrimination.
+
+    A match that formed no sets has no subjects to discriminate between, and is
+    reported as zero pairwise rows with a NaN mean.
     """
     if groups is None:
         groups = groups_from_matched(matched)
 
     if anchor_level is None:
         raise ValueError("`anchor_level` is required")
+
+    if len(matched) == 0:
+        return {
+            "pairwise": pd.DataFrame(
+                columns=["group_1", "group_2", "auc"]
+            ).astype({"auc": "float64"}),
+            "mean_auc": float("nan"),
+        }
 
     all_levels = [anchor_level] + list(groups)
 

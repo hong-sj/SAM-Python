@@ -53,9 +53,34 @@ def matched_frame_columns(groups, extra_columns=()):
     ]
 
 
+def matched_frame_dtypes(groups, extra_columns=()):
+    """
+    Return the dtype of each column of a matched-set frame.
+
+    Row references are integers and distances are floats. An empty frame has to
+    say so too: `pandas` infers `object` from no rows, and an `object` column
+    cannot be used to index `data`, so a zero-set match would otherwise fail
+    with a bare `IndexError` the first time any diagnostic touched it.
+    """
+    dtypes = {
+        "matched_set_id": "int64",
+        "anchor": "int64",
+        "loss": "float64",
+    }
+
+    for group in groups:
+        dtypes[group] = "int64"
+        dtypes[f"dist_{group}"] = "float64"
+
+    for column in extra_columns:
+        dtypes[column] = "float64"
+
+    return dtypes
+
+
 def build_matched_frame(matched_rows, groups, extra_columns=()):
     """
-    Assemble the matched-set frame, preserving the column schema when empty.
+    Assemble the matched-set frame with a schema independent of the result.
 
     Parameters
     ----------
@@ -69,14 +94,19 @@ def build_matched_frame(matched_rows, groups, extra_columns=()):
     Returns
     -------
     pandas.DataFrame
-        Matched sets, or an empty frame with the correct columns.
+        Matched sets, or an empty frame with the same columns and dtypes.
     """
     columns = matched_frame_columns(groups, extra_columns)
 
     # Supplying columns on both paths prevents dict insertion order in the
     # matching engines from making the populated schema differ from the empty
     # schema.
-    return pd.DataFrame(matched_rows, columns=columns)
+    matched = pd.DataFrame(matched_rows, columns=columns)
+
+    if len(matched) == 0:
+        matched = matched.astype(matched_frame_dtypes(groups, extra_columns))
+
+    return matched
 
 
 def groups_from_matched(matched):
@@ -109,14 +139,14 @@ def summarize_matching(matched, anchor_rows):
     Returns
     -------
     tuple
-        ``(unmatched_anchor_rows, matching_rate, max_possible_rate)``.
+        ``(unmatched_anchor_rows, matching_rate)``.
 
     Notes
     -----
     ``matching_rate`` is bounded above by the size of the smallest comparator
     group divided by the anchor count, since each matched set consumes one
-    subject from every comparator group. ``max_possible_rate`` is reported
-    alongside it so a rate that looks low can be recognised as saturated.
+    subject from every comparator group. `max_possible_rate()` reports that
+    ceiling, so a rate that looks low can be recognised as saturated.
     """
     anchor_rows = np.asarray(anchor_rows, dtype=int)
 
