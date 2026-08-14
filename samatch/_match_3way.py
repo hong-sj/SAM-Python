@@ -6,6 +6,7 @@ using a two-dimensional propensity score space, KD-tree candidate search,
 a perimeter-based caliper, and global greedy selection.
 """
 
+import heapq
 import warnings
 
 import numpy as np
@@ -448,15 +449,12 @@ def match_3way(
     exhausted = np.zeros(n_red, dtype=bool)
     counters = np.zeros(n_red, dtype=int)
 
-    pool_red = []
-    pool_o1 = []
-    pool_o2 = []
-    pool_perimeter = []
-    pool_dist_o1 = []
-    pool_dist_o2 = []
+    candidate_heap = []
+    next_candidate_order = 0
 
     def push_candidates(i):
         """Generate candidate trios for one search-base subject."""
+        nonlocal next_candidate_order
         point_red = coords_red[i]
 
         nearest_o1 = kdtree_nearest(
@@ -506,16 +504,12 @@ def match_3way(
         candidate_o1 = []
         candidate_o2 = []
         candidate_perimeter = []
-        candidate_dist_o1 = []
-        candidate_dist_o2 = []
 
         # Always consider the nearest-neighbor seed trio.
         if seed_perimeter <= caliper:
             candidate_o1.append(nearest_o1)
             candidate_o2.append(nearest_o2)
             candidate_perimeter.append(seed_perimeter)
-            candidate_dist_o1.append(dist_red_o1)
-            candidate_dist_o2.append(dist_red_o2)
 
         radius_sq = (seed_perimeter / 2) ** 2
 
@@ -583,12 +577,6 @@ def match_3way(
                 candidate_perimeter.extend(
                     perimeter[o1_idx, o2_idx].tolist()
                 )
-                candidate_dist_o1.extend(
-                    dist_red_to_o1[o1_idx].tolist()
-                )
-                candidate_dist_o2.extend(
-                    dist_red_to_o2[o2_idx].tolist()
-                )
 
         if len(candidate_perimeter) == 0:
             exhausted[i] = True
@@ -604,12 +592,20 @@ def match_3way(
         )[: min(top_n, len(candidate_perimeter))]
 
         for candidate_idx in order:
-            pool_red.append(i)
-            pool_o1.append(candidate_o1[candidate_idx])
-            pool_o2.append(candidate_o2[candidate_idx])
-            pool_perimeter.append(candidate_perimeter[candidate_idx])
-            pool_dist_o1.append(candidate_dist_o1[candidate_idx])
-            pool_dist_o2.append(candidate_dist_o2[candidate_idx])
+            # The monotonic insertion order is the second heap key. It
+            # preserves min(list, key=...)'s first-occurrence tie handling
+            # without scanning and deleting from parallel Python lists.
+            heapq.heappush(
+                candidate_heap,
+                (
+                    float(candidate_perimeter[candidate_idx]),
+                    next_candidate_order,
+                    i,
+                    candidate_o1[candidate_idx],
+                    candidate_o2[candidate_idx],
+                ),
+            )
+            next_candidate_order += 1
 
         counters[i] = len(order)
 
@@ -619,24 +615,14 @@ def match_3way(
     matched_rows = []
 
     # Global greedy selection without replacement.
-    while pool_perimeter:
-        # min() selects the first occurrence when perimeters are tied.
-        pop_idx = min(
-            range(len(pool_perimeter)),
-            key=lambda index: pool_perimeter[index],
-        )
-
-        red_idx_local = pool_red[pop_idx]
-        o1_idx_local = pool_o1[pop_idx]
-        o2_idx_local = pool_o2[pop_idx]
-        perimeter_selected = pool_perimeter[pop_idx]
-
-        del pool_red[pop_idx]
-        del pool_o1[pop_idx]
-        del pool_o2[pop_idx]
-        del pool_perimeter[pop_idx]
-        del pool_dist_o1[pop_idx]
-        del pool_dist_o2[pop_idx]
+    while candidate_heap:
+        (
+            perimeter_selected,
+            _,
+            red_idx_local,
+            o1_idx_local,
+            o2_idx_local,
+        ) = heapq.heappop(candidate_heap)
 
         if matched_flag[red_idx_local]:
             continue
