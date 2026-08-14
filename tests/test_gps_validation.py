@@ -114,3 +114,95 @@ def test_regularized_fallback_warning_is_not_swallowed(monkeypatch):
         _fit_unregularized_multinomial_logit(X, y)
 
     assert any("falling back" in str(warning.message) for warning in caught)
+
+
+def test_returned_model_applies_to_unstandardized_covariates():
+    """
+    Fitting standardizes the covariates for conditioning. That is an internal
+    detail, so the returned model must not require the caller to reproduce it:
+    scoring the covariates as they appear in `data` has to reproduce the GPS.
+    Previously the transformation was left in two private attributes and
+    `predict_proba` on the raw covariates was silently wrong.
+    """
+    data = samatch.load_sample_4group()
+    covariates = [
+        column
+        for column in data.columns
+        if column not in ("synthetic_id", "treatment", "mortality_28d")
+    ]
+    anchor = data["treatment"].astype(str).unique()[0]
+
+    fit = samatch.estimate_gps_multinom(
+        data, X_vars=covariates, treatment_var="treatment", anchor_level=anchor
+    )
+    model = fit["model"]
+    gps = fit["gps"]
+
+    scored = model.predict_proba(data[covariates].to_numpy(dtype=float))
+    order = [list(gps.columns).index(level) for level in model.classes_]
+
+    np.testing.assert_allclose(
+        scored, gps.to_numpy()[:, order], rtol=0, atol=1e-12
+    )
+
+    assert not [name for name in dir(model) if name.startswith("_sam_")]
+    assert model.coef_.shape == (len(model.classes_), len(covariates))
+
+
+def test_unregularized_fit_is_requested_in_a_way_this_sklearn_accepts():
+    """
+    scikit-learn 1.8 deprecated `penalty=None` and removes it in 1.10, pointing
+    at `C=np.inf`; the two give identical coefficients. Whichever spelling is
+    used, requesting it must not emit a deprecation warning at the caller, and
+    the model must actually be unregularized.
+    """
+    from samatch._gps import _fit_unregularized_multinomial_logit
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, 4))
+    y = rng.choice(list("ABC"), 400)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = _fit_unregularized_multinomial_logit(X, y)
+
+    assert not [
+        warning
+        for warning in caught
+        if issubclass(warning.category, (DeprecationWarning, FutureWarning))
+    ], [str(warning.message) for warning in caught]
+
+    # Whatever spelling was chosen, no shrinkage may be in effect.
+    assert getattr(model, "C", np.inf) == np.inf or model.penalty is None
+
+
+def test_unrelated_sklearn_warnings_are_not_swallowed():
+    """
+    The fit runs inside `catch_warnings(record=True)` so the convergence warning
+    can be reworded. Everything else scikit-learn reports has to be passed on.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    import samatch._gps as gps_module
+
+    class NoisyLogisticRegression(LogisticRegression):
+        def fit(self, X, y):
+            warnings.warn("something worth knowing", UserWarning)
+            return super().fit(X, y)
+
+    original = gps_module.LogisticRegression
+    gps_module.LogisticRegression = NoisyLogisticRegression
+
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gps_module._fit_unregularized_multinomial_logit(
+                np.array([[0.0], [1.0], [2.0], [3.0]]),
+                np.array(["A", "A", "B", "B"]),
+            )
+    finally:
+        gps_module.LogisticRegression = original
+
+    assert any(
+        "something worth knowing" in str(warning.message) for warning in caught
+    )

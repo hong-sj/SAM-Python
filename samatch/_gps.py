@@ -2,6 +2,7 @@
 Generalized propensity score estimation for Shared Anchor Matching.
 """
 
+import inspect
 import warnings
 
 import numpy as np
@@ -9,6 +10,40 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
 from ._validate import covariate_matrix, treatment_labels, treatment_level
+
+# scikit-learn changed how an unregularized fit is requested. Up to 1.7 it is
+# `penalty=None`; 1.8 deprecates that and directs callers to `C=np.inf`, and 1.10
+# removes `penalty` altogether. The two produce bit-identical coefficients, so
+# which one is used is purely a compatibility matter -- but getting it wrong
+# would silently substitute a regularized model, which is the one thing this
+# function promises not to be. The signature is the reliable signal: 1.8 marks
+# the parameter's default with a deprecation sentinel.
+_BENIGN_C_WARNING = "will ignore the C and l1_ratio"
+
+
+def _unregularized_kwargs():
+    """Return the keyword arguments that request an unregularized fit."""
+    try:
+        parameters = inspect.signature(LogisticRegression).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return {"penalty": None}
+
+    if "penalty" in parameters:
+        default = parameters["penalty"].default
+
+        if isinstance(default, str) and default == "deprecated":
+            return {"C": np.inf}
+
+        return {"penalty": None}
+
+    if "C" in parameters:
+        # A real signature that has dropped `penalty`: 1.10 and later.
+        return {"C": np.inf}
+
+    # Anything else -- notably a `**kwargs` signature -- says nothing either
+    # way. Use the historical spelling and let the fallback below deal with a
+    # version that rejects it.
+    return {"penalty": None}
 
 
 def _fit_unregularized_multinomial_logit(
@@ -32,10 +67,10 @@ def _fit_unregularized_multinomial_logit(
 
         try:
             model = LogisticRegression(
-                penalty=None,
                 solver="lbfgs",
                 max_iter=max_iter,
                 tol=tol,
+                **_unregularized_kwargs(),
             )
             model.fit(X_scaled, y)
         except TypeError as error:
@@ -56,6 +91,28 @@ def _fit_unregularized_multinomial_logit(
             for warning in caught
             if "Convergence" in warning.category.__name__
         ]
+
+    # Anything else scikit-learn had to say is re-emitted rather than dropped.
+    # Recording was only ever meant to intercept the convergence warning, whose
+    # wording is replaced below with one that names the parameter to raise;
+    # silencing the rest would hide, for example, a data-conversion warning.
+    #
+    # The one exception is scikit-learn 1.8 answering `C=np.inf` with a notice
+    # that C is ignored because the penalty is None. That is precisely what was
+    # asked for, so passing it on would be noise on every call.
+    for warning in caught:
+        if warning in convergence_warnings:
+            continue
+
+        if _BENIGN_C_WARNING in str(warning.message):
+            continue
+
+        warnings.warn_explicit(
+            warning.message,
+            warning.category,
+            warning.filename,
+            warning.lineno,
+        )
 
     if regularized_fallback:
         # Emit this after leaving catch_warnings(record=True). Warning inside
@@ -83,6 +140,36 @@ def _fit_unregularized_multinomial_logit(
 
     model._sam_standardize_mean = mean
     model._sam_standardize_sd = sd_safe
+
+    return model
+
+
+def _absorb_standardization(model):
+    """
+    Rewrite the coefficients so the model applies to unstandardized covariates.
+
+    Standardizing only helps the optimizer; a caller holding the returned model
+    should not have to know it happened. Folding the shift and scale into the
+    coefficients means `model.predict_proba()` can be applied to the covariates
+    as they appear in `data`, and `model.coef_` is on their original scale.
+    Without this the model silently returns probabilities for the wrong point,
+    since nothing about it signals that an undone transformation is required.
+
+        eta = b0 + sum_j c_j (x_j - m_j) / s_j
+            = (b0 - sum_j (c_j / s_j) m_j) + sum_j (c_j / s_j) x_j
+    """
+    mean = model._sam_standardize_mean
+    sd_safe = model._sam_standardize_sd
+
+    if not hasattr(model, "coef_") or not hasattr(model, "intercept_"):
+        # A stand-in used only to exercise the version fallback below.
+        return model
+
+    model.coef_ = model.coef_ / sd_safe
+    model.intercept_ = model.intercept_ - model.coef_ @ mean
+
+    del model._sam_standardize_mean
+    del model._sam_standardize_sd
 
     return model
 
@@ -138,12 +225,16 @@ def estimate_gps_multinom(
         tol=1e-10,
     )
 
-    # Apply the same standardization used during model fitting.
+    # Predict on the same scale the model was fitted on, then fold the
+    # standardization into the coefficients so the returned model needs no
+    # such handling from the caller.
     X_scaled = (
         X - model._sam_standardize_mean
     ) / model._sam_standardize_sd
 
     probabilities = model.predict_proba(X_scaled)
+
+    _absorb_standardization(model)
 
     other_levels = [
         level
