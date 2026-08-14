@@ -22,6 +22,7 @@ from ._validate import (
     check_data_fingerprint,
     check_gps_fingerprint,
     require_positive_int,
+    treatment_labels,
     treatment_level,
     validate_gps,
 )
@@ -116,12 +117,19 @@ def kdtree_build(coords, idx=None, depth=0):
     Returns
     -------
     dict
-        KD-tree node.
+        KD-tree node. Each node carries ``n_active``, the number of points in
+        its subtree that are still available; see `kdtree_deactivate()`.
     """
     coords = np.asarray(coords, dtype=float)
 
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError("`coords` must have exactly two columns.")
+
     if idx is None:
         idx = np.arange(coords.shape[0])
+
+    if len(idx) == 0:
+        raise ValueError("a KD-tree needs at least one point.")
 
     n = len(idx)
 
@@ -129,6 +137,7 @@ def kdtree_build(coords, idx=None, depth=0):
         return {
             "leaf": True,
             "point": int(idx[0]),
+            "n_active": 1,
         }
 
     dim = depth % 2
@@ -146,9 +155,74 @@ def kdtree_build(coords, idx=None, depth=0):
         "leaf": False,
         "split_dim": dim,
         "split_val": split_val,
+        "n_active": n,
         "left": kdtree_build(coords, left_idx, depth + 1),
         "right": kdtree_build(coords, right_idx, depth + 1),
     }
+
+
+def kdtree_index(node, n_points):
+    """
+    Link each point to its leaf so that consumption can be propagated upward.
+
+    Parameters
+    ----------
+    node : dict
+        Root of a tree from `kdtree_build()`.
+    n_points : int
+        Number of points the tree was built over.
+
+    Returns
+    -------
+    list
+        ``leaf_of[point]`` is the leaf node holding that point.
+
+    Notes
+    -----
+    Descending to a point by comparing against ``split_val`` is not reliable:
+    the build splits a stable ordering at its midpoint, so a point whose
+    coordinate equals the split value may sit on either side. Recording the
+    leaves once, together with a parent link, gives an unambiguous path.
+    """
+    leaf_of = [None] * n_points
+    stack = [(node, None)]
+
+    while stack:
+        current, parent = stack.pop()
+        current["parent"] = parent
+
+        if current["leaf"]:
+            leaf_of[current["point"]] = current
+        else:
+            stack.append((current["left"], current))
+            stack.append((current["right"], current))
+
+    return leaf_of
+
+
+def kdtree_deactivate(leaf):
+    """
+    Mark one point as consumed, so its exhausted ancestors can be skipped.
+
+    Parameters
+    ----------
+    leaf : dict
+        Leaf node for the consumed point, from `kdtree_index()`.
+
+    Notes
+    -----
+    Must be called exactly once per point, paired with setting that point's
+    entry in the caller's ``active`` array to False. `kdtree_nearest()` and
+    `kdtree_range()` still consult ``active`` at the leaves, so a caller that
+    skips this only forfeits the pruning -- results are unaffected either way.
+    Without it, a query late in the matching loop walks a tree that is mostly
+    consumed, which is what made three-way matching grow superlinearly.
+    """
+    node = leaf
+
+    while node is not None:
+        node["n_active"] -= 1
+        node = node["parent"]
 
 
 def kdtree_nearest(node, coords, query, active):
@@ -171,6 +245,13 @@ def kdtree_nearest(node, coords, query, active):
     int or None
         Index of the nearest active point, or None if none is available.
     """
+    # A subtree with nothing left in it cannot hold the answer. This is only
+    # informative for callers that report consumption via kdtree_deactivate();
+    # for the rest the count stays at its initial value and the walk proceeds
+    # exactly as before.
+    if node["n_active"] == 0:
+        return None
+
     if node["leaf"]:
         point = node["point"]
         return point if active[point] else None
@@ -227,7 +308,22 @@ def kdtree_range(node, coords, query, radius2, active):
     -------
     list of int
         Indices of active points within the search radius.
+
+    Notes
+    -----
+    A subtree with nothing available in it is skipped. That only removes points
+    which could not have been returned, so the result -- and its order -- is
+    the same as an exhaustive scan.
+
+    Pruning on a per-node bounding box was tried as well and removed: it cut
+    only 8% of visited nodes, because the subtree the query descends into always
+    contains the query and so is never outside the radius, while the test cost
+    applies to every node visited. Reducing the node count further needs a
+    C-level tree, not a tighter bound here.
     """
+    if node["n_active"] == 0:
+        return []
+
     if node["leaf"]:
         point = node["point"]
 
@@ -365,7 +461,7 @@ def match_3way(
         )
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
-    treatment = data[treatment_var].astype(str).to_numpy()
+    treatment = treatment_labels(data, treatment_var)
 
     anchor_levels = np.unique(treatment[anchor_rows])
 
@@ -446,11 +542,49 @@ def match_3way(
     coords_o1 = ps_used[rows_by_level[o1]]
     coords_o2 = ps_used[rows_by_level[o2]]
 
-    tree_o1 = kdtree_build(coords_o1)
-    tree_o2 = kdtree_build(coords_o2)
-
     active_o1 = np.ones(len(coords_o1), dtype=bool)
     active_o2 = np.ones(len(coords_o2), dtype=bool)
+
+    # A KD-tree built once over every subject keeps describing subjects that
+    # have since been matched away: its bounding boxes stay wide and its
+    # subtrees stay walkable while holding almost nothing available, so late
+    # queries walk the whole consumed neighbourhood to find a few survivors.
+    # Rebuilding over the survivors whenever half of them are gone keeps every
+    # query proportional to what is actually left, at an amortised cost of
+    # O(n log n) per halving.
+    #
+    # `kdtree_build()` takes the surviving positions directly and keeps
+    # reporting original ones, so a rebuild is transparent to everything else.
+    trees = {}
+
+    def rebuild(side, coords, active):
+        """Index the surviving subjects of one comparator group."""
+        survivors = np.flatnonzero(active)
+
+        if len(survivors) == 0:
+            trees[side] = (None, None, 0)
+            return
+
+        root = kdtree_build(coords, survivors)
+
+        trees[side] = (
+            root,
+            kdtree_index(root, len(coords)),
+            len(survivors),
+        )
+
+    def consume(side, coords, active, point):
+        """Retire one subject, rebuilding the index once half of them are gone."""
+        root, leaf_of, at_last_rebuild = trees[side]
+
+        active[point] = False
+        kdtree_deactivate(leaf_of[point])
+
+        if root["n_active"] * 2 <= at_last_rebuild:
+            rebuild(side, coords, active)
+
+    rebuild("o1", coords_o1, active_o1)
+    rebuild("o2", coords_o2, active_o2)
 
     matched_flag = np.zeros(n_red, dtype=bool)
     exhausted = np.zeros(n_red, dtype=bool)
@@ -463,6 +597,14 @@ def match_3way(
         """Generate candidate trios for one search-base subject."""
         nonlocal next_candidate_order
         point_red = coords_red[i]
+
+        tree_o1 = trees["o1"][0]
+        tree_o2 = trees["o2"][0]
+
+        if tree_o1 is None or tree_o2 is None:
+            exhausted[i] = True
+            counters[i] = 0
+            return
 
         nearest_o1 = kdtree_nearest(
             tree_o1,
@@ -636,8 +778,9 @@ def match_3way(
 
         if active_o1[o1_idx_local] and active_o2[o2_idx_local]:
             matched_flag[red_idx_local] = True
-            active_o1[o1_idx_local] = False
-            active_o2[o2_idx_local] = False
+
+            consume("o1", coords_o1, active_o1, o1_idx_local)
+            consume("o2", coords_o2, active_o2, o2_idx_local)
 
             row_red = int(
                 rows_by_level[red_level][red_idx_local]
