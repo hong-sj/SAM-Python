@@ -282,24 +282,36 @@ def extract_matched_data(
     )
 
     # Each matched set must contain exactly one subject per treatment group.
-    set_sizes = matched_data.groupby(
-        "matched_set_id",
-        sort=False,
-    ).size()
+    #
+    # Both counts are integer tabulations, so they are done with `bincount`
+    # rather than `groupby`/`crosstab`: crosstab aggregates cell by cell in
+    # pure Python, which on a 20,000-row cohort was 93% of the cost of this
+    # whole function.
+    set_codes, unique_sets = pd.factorize(matched_data["matched_set_id"])
+    n_sets = len(unique_sets)
 
-    if not np.all(set_sizes.to_numpy() == k):
+    set_sizes = np.bincount(set_codes, minlength=n_sets)
+
+    if not np.all(set_sizes == k):
         raise ValueError(
             f"At least one matched set does not contain exactly {k} subjects."
         )
 
-    count_table = pd.crosstab(
-        matched_data["matched_set_id"],
-        matched_data[treatment_var].astype(str),
+    # A label outside `treatment_order` indexes to -1; those are collected in a
+    # (k+1)-th bucket so that they still fail the one-per-group check below,
+    # exactly as the extra crosstab column used to.
+    role_codes = pd.Index(treatment_order).get_indexer(
+        matched_data[treatment_var].astype(str)
     )
+    bucket_codes = np.where(role_codes < 0, k, role_codes)
+
+    observed = np.zeros(k + 1, dtype=bool)
+    observed[bucket_codes] = True
 
     missing_groups = [
-        group for group in treatment_order
-        if group not in count_table.columns
+        group
+        for index, group in enumerate(treatment_order)
+        if not observed[index]
     ]
 
     if missing_groups:
@@ -308,7 +320,12 @@ def extract_matched_data(
             + ", ".join(missing_groups)
         )
 
-    if not np.all(count_table[treatment_order].to_numpy() == 1):
+    cell_counts = np.bincount(
+        set_codes * (k + 1) + bucket_codes,
+        minlength=n_sets * (k + 1),
+    ).reshape(n_sets, k + 1)
+
+    if not np.all(cell_counts[:, :k] == 1):
         raise ValueError(
             "Each matched set must contain exactly one subject "
             "from every treatment group."
