@@ -1,4 +1,6 @@
-# SAM
+# SAM-Python
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21926925.svg)](https://doi.org/10.5281/zenodo.21926925)
 
 ## Shared Anchor Matching: A Scalable Matching Framework for Multiple Treatment Groups
 
@@ -279,9 +281,11 @@ data4 = load_sample_4group()
 
 ## Citation
 
-If you use SAM in your research, please cite the associated methodological work.
+If you use SAM-Python in your research, please cite:
 
-A formal citation will be added upon publication.
+> Hong S, Hong S, Lee KH, Cha N. **SAM-Python: Shared Anchor Matching**. Version 0.1.0. Zenodo. https://doi.org/10.5281/zenodo.21926925
+
+A formal citation for the associated methodological paper will be added upon publication.
 
 ---
 
