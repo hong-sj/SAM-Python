@@ -202,8 +202,10 @@ def test_build_matched_frame_schema_matches_the_populated_case():
                 "matched_set_id": 1,
                 "anchor": 0,
                 "B": 1,
-                "C": 2,
                 "dist_B": 0.5,
+                # Deliberately use the interleaved insertion order emitted by
+                # the matching engines. The assembly helper owns the schema.
+                "C": 2,
                 "dist_C": 0.25,
                 "loss": 0.75,
             }

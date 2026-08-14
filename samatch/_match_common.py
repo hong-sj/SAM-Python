@@ -71,10 +71,12 @@ def build_matched_frame(matched_rows, groups, extra_columns=()):
     pandas.DataFrame
         Matched sets, or an empty frame with the correct columns.
     """
-    if matched_rows:
-        return pd.DataFrame(matched_rows)
+    columns = matched_frame_columns(groups, extra_columns)
 
-    return pd.DataFrame(columns=matched_frame_columns(groups, extra_columns))
+    # Supplying columns on both paths prevents dict insertion order in the
+    # matching engines from making the populated schema differ from the empty
+    # schema.
+    return pd.DataFrame(matched_rows, columns=columns)
 
 
 def groups_from_matched(matched):
