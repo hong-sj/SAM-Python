@@ -7,7 +7,7 @@ import heapq
 import numpy as np
 import pandas as pd
 
-from ._mahalanobis import get_pooled_covariance, mahalanobis_distance_matrix
+from ._mahalanobis import get_pooled_covariance
 from ._match_common import (
     build_matched_frame,
     max_possible_rate,
@@ -99,44 +99,71 @@ def sam_match(
 
     # Convert global candidate rows to within-group positions and calculate
     # Mahalanobis distances only for GPS-screened candidates.
-    local_position = {
-        group: {
-            row: position
-            for position, row in enumerate(group_rows[group])
-        }
-        for group in groups
-    }
+    #
+    # Every screened pair of a group is done in one pass. This is the same
+    # expanded form `mahalanobis_distance_matrix()` uses -- squared norms under
+    # S_inv minus twice the cross term, clamped at zero -- but calling that
+    # function once per anchor spent most of this loop dispatching numpy over
+    # one-row queries: at n = 20,000 it was 17,316 calls and 38% of this
+    # function. The cross term stays a row-wise dot product over the screened
+    # pairs rather than an anchor-by-group matrix, whose 32M entries are what
+    # made the original full-matrix implementation run out of memory.
+    anchor_transformed = x_anchor @ s_inv
+    anchor_sq = np.sum(anchor_transformed * x_anchor, axis=1)
 
-    candidate_local = {group: [] for group in groups}
-    candidate_distance = {group: [] for group in groups}
+    candidate_local = {}
+    candidate_distance = {}
 
     for group in groups:
-        for i in range(n_anchor):
-            local_indices = np.asarray(
-                [
-                    local_position[group][row]
-                    for row in candidates[i][group]
-                    if row in local_position[group]
-                ],
-                dtype=int,
-            )
+        rows_of_group = group_rows[group]
 
-            if len(local_indices) == 0:
-                candidate_local[group].append(local_indices)
-                candidate_distance[group].append(np.array([], dtype=float))
-                continue
+        position_in_group = np.full(len(data), -1, dtype=int)
+        position_in_group[rows_of_group] = np.arange(len(rows_of_group))
 
-            distances = mahalanobis_distance_matrix(
-                x_anchor[i : i + 1],
-                x_group[group][local_indices],
-                s_inv,
-            )[0]
+        per_anchor = [
+            position_in_group[np.asarray(candidates[i][group], dtype=int)]
+            for i in range(n_anchor)
+        ]
+        per_anchor = [
+            positions[positions >= 0] for positions in per_anchor
+        ]
 
-            # Stable sorting preserves deterministic tie handling.
-            order = np.argsort(distances, kind="stable")
+        counts = np.fromiter(
+            (len(positions) for positions in per_anchor),
+            dtype=int,
+            count=n_anchor,
+        )
+        flat_candidate = (
+            np.concatenate(per_anchor)
+            if n_anchor
+            else np.empty(0, dtype=int)
+        )
+        flat_anchor = np.repeat(np.arange(n_anchor), counts)
 
-            candidate_local[group].append(local_indices[order])
-            candidate_distance[group].append(distances[order])
+        x_this_group = x_group[group]
+        group_transformed = x_this_group @ s_inv
+        group_sq = np.sum(group_transformed * x_this_group, axis=1)
+
+        cross = np.sum(
+            anchor_transformed[flat_anchor] * x_this_group[flat_candidate],
+            axis=1,
+        )
+        distance_sq = anchor_sq[flat_anchor] + group_sq[flat_candidate] - 2 * cross
+
+        # Guard against small negative values from floating-point error.
+        distance_sq[distance_sq < 0] = 0.0
+        flat_distance = np.sqrt(distance_sq)
+
+        # One global ordering in place of a stable sort per anchor. Within an
+        # anchor's contiguous block, ranking by position is the same tie-break
+        # a per-anchor stable sort applies, so the permutation is unchanged.
+        order = np.lexsort(
+            (np.arange(len(flat_distance)), flat_distance, flat_anchor)
+        )
+        boundaries = np.cumsum(counts)[:-1]
+
+        candidate_local[group] = np.split(flat_candidate[order], boundaries)
+        candidate_distance[group] = np.split(flat_distance[order], boundaries)
 
     active = {
         group: np.ones(len(group_rows[group]), dtype=bool)
