@@ -12,6 +12,7 @@ from ._diagnostics import (
     compute_pairwise_treatment_auc,
     compute_smd_balance,
 )
+from ._utils_math import expit
 from ._validate import (
     check_data_fingerprint,
     check_gps_fingerprint,
@@ -234,26 +235,19 @@ def extract_matched_data(
     else:
         set_ids = np.arange(1, len(matched) + 1, dtype=int)
 
-    # Expand matched sets into subject-level records.
-    index_rows = []
+    # Expand matched sets into subject-level records. Reshaping the whole block
+    # at once rather than looping: `matched.iloc[i][column]` builds a fresh row
+    # Series per access, which made this step cost as much as the match itself.
+    subject_rows = matched[["anchor", *groups]].to_numpy(dtype=int)
 
-    for i in range(len(matched)):
-        subject_rows = [
-            int(matched.iloc[i]["anchor"]),
-            *[int(matched.iloc[i][group]) for group in groups],
-        ]
-
-        for role, subject_row in zip(treatment_order, subject_rows):
-            index_rows.append(
-                {
-                    "matched_set_id": set_ids[i],
-                    "matched_role": role,
-                    "original_row": subject_row,
-                }
-            )
-
-    matched_index = pd.DataFrame(index_rows)
-    original_rows = matched_index["original_row"].to_numpy(dtype=int)
+    original_rows = subject_rows.reshape(-1)
+    matched_index = pd.DataFrame(
+        {
+            "matched_set_id": np.repeat(set_ids, k),
+            "matched_role": np.tile(np.asarray(treatment_order, dtype=object), len(matched)),
+            "original_row": original_rows,
+        }
+    )
 
     if np.any(original_rows < 0) or np.any(original_rows >= len(data)):
         raise ValueError(
@@ -389,7 +383,7 @@ def _fit_treatment_only_logistic(
 
     for _ in range(max_iter):
         eta = X @ beta
-        mu = 1.0 / (1.0 + np.exp(-eta))
+        mu = expit(eta)
         weights = mu * (1 - mu)
 
         score = X.T @ (y - mu)
@@ -409,7 +403,7 @@ def _fit_treatment_only_logistic(
 
         beta = beta_new
 
-    mu = 1.0 / (1.0 + np.exp(-(X @ beta)))
+    mu = expit(X @ beta)
 
     return {
         "beta": beta,
@@ -704,13 +698,9 @@ def sam_estimate_effects(
             np.sqrt(x_group @ vcov_cluster @ x_group)
         )
 
-        risk = 1.0 / (1.0 + np.exp(-eta_group))
-        risk_ci_low = 1.0 / (
-            1.0 + np.exp(-(eta_group - z_value * se_eta_group))
-        )
-        risk_ci_high = 1.0 / (
-            1.0 + np.exp(-(eta_group + z_value * se_eta_group))
-        )
+        risk = expit(eta_group)
+        risk_ci_low = expit(eta_group - z_value * se_eta_group)
+        risk_ci_high = expit(eta_group + z_value * se_eta_group)
 
         is_group = (
             analysis_data[treatment_var].astype(str) == group
@@ -738,11 +728,10 @@ def sam_estimate_effects(
         coef_j = coef_index[coef_name]
 
         def risk_anchor_fun(b):
-            return 1.0 / (1.0 + np.exp(-b[0]))
+            return expit(b[0])
 
         def risk_comparator_fun(b):
-            eta = b[0] + b[coef_j]
-            return 1.0 / (1.0 + np.exp(-eta))
+            return expit(b[0] + b[coef_j])
 
         def log_or_fun(b):
             return float(b[coef_j])

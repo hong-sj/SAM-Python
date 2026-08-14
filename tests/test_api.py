@@ -384,3 +384,53 @@ def test_build_group_distance_matrices_shapes_and_values(three_group):
             X[search["anchor_rows"]], X[rows], built["S_inv"]
         )
         np.testing.assert_allclose(built["D"][group], expected)
+
+
+def test_extract_matched_data_expands_sets_without_reordering():
+    """
+    The expansion is a reshape of the matched-set block rather than a per-row
+    loop. Role order within a set, and set order overall, must be unaffected.
+    """
+    data = samatch.load_sample_4group()
+    covariates = [
+        column
+        for column in data.columns
+        if column not in ("synthetic_id", "treatment", "mortality_28d")
+    ]
+    anchor = data["treatment"].astype(str).unique()[0]
+
+    fit = samatch.estimate_gps_multinom(
+        data, X_vars=covariates, treatment_var="treatment", anchor_level=anchor
+    )
+    search = samatch.gps_candidate_search(
+        data,
+        fit["gps"],
+        treatment_var="treatment",
+        anchor_level=anchor,
+        top_m=10,
+        gps_space="logit",
+    )
+    matched = samatch.sam_match(
+        data, search, X_vars=covariates, treatment_var="treatment"
+    )
+    cohort = samatch.extract_matched_data(
+        data, search, matched, treatment_var="treatment"
+    )
+
+    expected_order = [anchor, *search["groups"]]
+    k = len(expected_order)
+
+    assert len(cohort) == k * len(matched["matched"])
+    assert cohort["matched_role"].tolist()[:k] == expected_order
+    assert (cohort["matched_role"] == cohort["treatment"].astype(str)).all()
+
+    # Every subject-level row must point back at the row the matched set named.
+    # The anchor is held in the "anchor" column, comparators under their group.
+    first_set = matched["matched"].iloc[0]
+    np.testing.assert_array_equal(
+        cohort["original_row"].to_numpy()[:k],
+        np.array(
+            [first_set["anchor"], *[first_set[g] for g in search["groups"]]],
+            dtype=int,
+        ),
+    )

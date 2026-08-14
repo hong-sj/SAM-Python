@@ -264,15 +264,18 @@ def compute_weighted_balance(
     summary_rows = []
 
     for group in groups:
-        group_rows = by_covariate.loc[by_covariate["group"] == group]
-        values = group_rows.loc[group_rows["smd_defined"], "smd"].abs()
+        # Not `group_rows`: that name already holds this function's row indices
+        # per treatment group, and shadowing it here would be a trap for the
+        # next change to this loop.
+        group_smd = by_covariate.loc[by_covariate["group"] == group]
+        values = group_smd.loc[group_smd["smd_defined"], "smd"].abs()
 
         summary_rows.append(
             {
                 "group": group,
                 "mean_abs_smd": values.mean(),
                 "max_abs_smd": values.max(),
-                "n_undefined": int((~group_rows["smd_defined"]).sum()),
+                "n_undefined": int((~group_smd["smd_defined"]).sum()),
             }
         )
 
