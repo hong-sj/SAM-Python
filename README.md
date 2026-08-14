@@ -17,7 +17,7 @@ The package also provides tools for covariate-balance assessment, treatment-disc
 Install the latest release from PyPI:
 
 ```bash
-pip install sam-shared-anchor-matching
+pip install samatch
 ```
 
 Install the package from GitHub:
@@ -36,12 +36,12 @@ import samatch
 
 ## Quick Start
 
-The package includes `sample_4group`, an example dataset with four treatment groups.
+Import SAMatch and load the included four-treatment-group example dataset:
 
 ```python
-from samatch import load_sample_4group
+import samatch
 
-data = load_sample_4group()
+data = samatch.load_sample_4group()
 
 print(data.head())
 print(data["treatment"].value_counts())
