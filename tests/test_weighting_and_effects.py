@@ -98,7 +98,7 @@ def test_zero_propensity_score_produces_infinity_without_trimming():
     assert trimmed["n_trimmed"] == 1
 
 
-@pytest.mark.parametrize("trim", [-0.1, 1.0, 2.0])
+@pytest.mark.parametrize("trim", [-0.1, 1.0, 2.0, np.nan, np.inf, True, "0.1"])
 def test_invalid_trim_raises(four_group, trim):
     data, _, anchor, fit = four_group
 
@@ -154,6 +154,53 @@ def test_evaluate_comparator_weighting_reports_trimming(four_group):
 
     assert result["n_trimmed"] == 0
     assert (result["balance"]["summary"]["n_undefined"] == 0).all()
+
+
+def test_numeric_anchor_level_is_canonicalized_for_weighted_balance():
+    frame = pd.DataFrame(
+        {"T": [0, 0, 1, 1], "x": [0.0, 1.0, 2.0, 3.0]}
+    )
+
+    numeric = samatch.compute_weighted_balance(
+        frame,
+        np.ones(len(frame)),
+        X_vars=["x"],
+        treatment_var="T",
+        anchor_level=0,
+    )
+    string = samatch.compute_weighted_balance(
+        frame,
+        np.ones(len(frame)),
+        X_vars=["x"],
+        treatment_var="T",
+        anchor_level="0",
+    )
+
+    pd.testing.assert_frame_equal(numeric["by_covariate"], string["by_covariate"])
+    assert numeric["by_covariate"]["smd_defined"].all()
+
+
+@pytest.mark.parametrize(
+    "weights, message",
+    [
+        ([1.0, np.nan, 1.0, 1.0], "finite"),
+        ([1.0, -1.0, 1.0, 1.0], "non-negative"),
+        ([0.0, 0.0, 1.0, 1.0], "positive sum"),
+    ],
+)
+def test_weighted_balance_rejects_invalid_weights(weights, message):
+    frame = pd.DataFrame(
+        {"T": ["A", "A", "B", "B"], "x": [0.0, 1.0, 2.0, 3.0]}
+    )
+
+    with pytest.raises(ValueError, match=message):
+        samatch.compute_weighted_balance(
+            frame,
+            weights,
+            X_vars=["x"],
+            treatment_var="T",
+            anchor_level="A",
+        )
 
 
 # Effective sample size --------------------------------------------------------

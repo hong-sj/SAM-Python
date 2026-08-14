@@ -91,10 +91,17 @@ def compute_balancing_weights(
             "Treatment group(s) not found in gps: " + ", ".join(missing_levels)
         )
 
-    if trim < 0 or trim >= 1:
+    if (
+        isinstance(trim, bool)
+        or not isinstance(trim, (int, float, np.integer, np.floating))
+        or not np.isfinite(trim)
+        or trim < 0
+        or trim >= 1
+    ):
         raise ValueError("trim must be in [0, 1)")
 
-    gps_values = gps.to_numpy(dtype=float)
+    trim = float(trim)
+
     column_index = {column: i for i, column in enumerate(gps.columns)}
 
     # Bound the scores away from zero before dividing by them. Left unbounded,
@@ -174,13 +181,50 @@ def compute_weighted_balance(
 
     weights = np.asarray(weights, dtype=float)
 
+    if weights.ndim != 1:
+        raise ValueError("weights must be a one-dimensional array")
+
     if len(weights) != len(data):
         raise ValueError(
             "weights and data must contain the same number of observations"
         )
 
-    treatment = data[treatment_var].astype(str).to_numpy()
+    if not np.isfinite(weights).all():
+        raise ValueError("weights must all be finite")
+
+    if np.any(weights < 0):
+        raise ValueError("weights must be non-negative")
+
+    treatment = treatment_labels(data, treatment_var)
+    anchor_level = treatment_level(anchor_level)
     groups = [group for group in pd.unique(treatment) if group != anchor_level]
+
+    anchor_rows = require_rows(
+        np.flatnonzero(treatment == anchor_level),
+        anchor_level,
+        treatment_var,
+    )
+    group_rows = {
+        group: require_rows(
+            np.flatnonzero(treatment == group), group, treatment_var
+        )
+        for group in groups
+    }
+
+    X = covariate_matrix(data, X_vars)
+
+    if weights[anchor_rows].sum() <= 0:
+        raise ValueError("anchor-group weights must have a positive sum")
+
+    zero_weight_groups = [
+        group for group, rows in group_rows.items() if weights[rows].sum() <= 0
+    ]
+
+    if zero_weight_groups:
+        raise ValueError(
+            "Weights must have a positive sum in every treatment group; "
+            "zero total weight in: " + ", ".join(zero_weight_groups)
+        )
 
     def weighted_mean(x, w):
         return np.sum(x * w) / np.sum(w)
@@ -195,8 +239,8 @@ def compute_weighted_balance(
     for group in groups:
         group_mask = treatment == group
 
-        for covariate in X_vars:
-            x = data[covariate].to_numpy(dtype=float)
+        for position, covariate in enumerate(X_vars):
+            x = X[:, position]
 
             mean_anchor = weighted_mean(x[anchor_mask], weights[anchor_mask])
             mean_group = weighted_mean(x[group_mask], weights[group_mask])
