@@ -56,6 +56,26 @@ def calc_caliper_3way(ps_used, treatment_var_values):
 
     groups = np.unique(treatment_var_values)
 
+    if len(groups) != 3:
+        raise ValueError(
+            "`treatment_var_values` must contain exactly three treatment groups."
+        )
+
+    if not np.isfinite(ps_used).all():
+        raise ValueError("`ps_used` must contain only finite values.")
+
+    too_small = [
+        str(group)
+        for group in groups
+        if np.sum(treatment_var_values == group) < 2
+    ]
+
+    if too_small:
+        raise ValueError(
+            "The automatic three-way caliper requires at least two subjects "
+            "in every treatment group; too few in: " + ", ".join(too_small)
+        )
+
     var_by_group = np.array(
         [
             [
@@ -362,6 +382,8 @@ def match_3way(
 
     if reference_level is None:
         reference_level = all_levels[-1]
+    else:
+        reference_level = treatment_level(reference_level)
 
     if reference_level not in all_levels:
         raise ValueError(
@@ -384,8 +406,8 @@ def match_3way(
 
     caliper = float(caliper)
 
-    if caliper <= 0:
-        raise ValueError("`caliper` must be greater than zero.")
+    if not np.isfinite(caliper) or caliper <= 0:
+        raise ValueError("`caliper` must be finite and greater than zero.")
 
     # Use the smallest treatment group as the search base.
     rows_by_level = {

@@ -259,11 +259,11 @@ def test_match_3way_requires_exactly_three_groups():
         )
 
 
-@pytest.mark.parametrize("caliper", [0.0, -1.0])
+@pytest.mark.parametrize("caliper", [0.0, -1.0, np.nan, np.inf])
 def test_non_positive_caliper_raises(three_group, caliper):
     data, _, fit, search = three_group
 
-    with pytest.raises(ValueError, match="greater than zero"):
+    with pytest.raises(ValueError, match="finite and greater than zero"):
         samatch.match_3way(
             data,
             search,
@@ -271,6 +271,26 @@ def test_non_positive_caliper_raises(three_group, caliper):
             treatment_var="treatment",
             caliper=caliper,
         )
+
+
+def test_auto_caliper_rejects_a_singleton_treatment_group():
+    data = pd.DataFrame({"T": ["A", "B", "C"]})
+    gps = pd.DataFrame(
+        {
+            "A": [0.8, 0.1, 0.1],
+            "B": [0.1, 0.8, 0.1],
+            "C": [0.1, 0.1, 0.8],
+        },
+        index=data.index,
+    )
+    search = samatch.gps_candidate_search(data, gps, anchor_level="A", top_m=1)
+
+    with pytest.raises(ValueError, match="at least two subjects"):
+        samatch.match_3way(data, search, gps, caliper="auto")
+
+    # An explicitly chosen finite caliper remains valid for this small cohort.
+    result = samatch.match_3way(data, search, gps, caliper=10.0)
+    assert len(result["matched"]) == 1
 
 
 def test_invalid_caliper_string_raises(three_group):
