@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "samatch"
-version = "0.1.1"
+version = "0.1.2"
 description = "Shared Anchor Matching: a scalable matching framework for multiple treatment groups."
 readme = "README.md"
 requires-python = ">=3.9"
