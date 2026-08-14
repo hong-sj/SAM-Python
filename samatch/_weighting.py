@@ -83,9 +83,11 @@ def compute_balancing_weights(
     )
     treatment = treatment_labels(data, treatment_var)
 
-    missing_levels = [
-        level for level in np.unique(treatment) if level not in gps.columns
-    ]
+    # Hash rather than sort the treatment column; see the same check in
+    # `validate_gps`. Sorting only the missing levels keeps the message stable.
+    missing_levels = sorted(
+        level for level in pd.unique(treatment) if level not in gps.columns
+    )
     if missing_levels:
         raise ValueError(
             "Treatment group(s) not found in gps: " + ", ".join(missing_levels)
@@ -226,27 +228,46 @@ def compute_weighted_balance(
             "zero total weight in: " + ", ".join(zero_weight_groups)
         )
 
-    def weighted_mean(x, w):
-        return np.sum(x * w) / np.sum(w)
+    # The weight total and the mean are passed in rather than recomputed: the
+    # variance needs the mean its caller already has, and every covariate in an
+    # arm shares one weight total.
+    def weighted_mean(x, w, w_sum):
+        return np.sum(x * w) / w_sum
 
-    def weighted_variance(x, w):
-        mean = weighted_mean(x, w)
-        return np.sum(w * (x - mean) ** 2) / np.sum(w)
+    def weighted_variance(x, w, w_sum, mean):
+        return np.sum(w * (x - mean) ** 2) / w_sum
 
     rows = []
     anchor_mask = treatment == anchor_level
 
+    # Each arm's covariates and weights are gathered once, outside the covariate
+    # loop. Re-running the boolean gather per covariate copied 20,000 elements
+    # eight times over for each of the covariates, which at that size cost far
+    # more than the arithmetic it fed.
+    x_anchor_all = X[anchor_mask]
+    w_anchor = weights[anchor_mask]
+    w_anchor_sum = np.sum(w_anchor)
+
     for group in groups:
         group_mask = treatment == group
 
+        x_group_all = X[group_mask]
+        w_group = weights[group_mask]
+        w_group_sum = np.sum(w_group)
+
         for position, covariate in enumerate(X_vars):
-            x = X[:, position]
+            x_anchor = x_anchor_all[:, position]
+            x_group = x_group_all[:, position]
 
-            mean_anchor = weighted_mean(x[anchor_mask], weights[anchor_mask])
-            mean_group = weighted_mean(x[group_mask], weights[group_mask])
+            mean_anchor = weighted_mean(x_anchor, w_anchor, w_anchor_sum)
+            mean_group = weighted_mean(x_group, w_group, w_group_sum)
 
-            var_anchor = weighted_variance(x[anchor_mask], weights[anchor_mask])
-            var_group = weighted_variance(x[group_mask], weights[group_mask])
+            var_anchor = weighted_variance(
+                x_anchor, w_anchor, w_anchor_sum, mean_anchor
+            )
+            var_group = weighted_variance(
+                x_group, w_group, w_group_sum, mean_group
+            )
 
             pooled_sd = np.sqrt((var_anchor + var_group) / 2)
             smd = (mean_anchor - mean_group) / pooled_sd if pooled_sd > 0 else 0.0

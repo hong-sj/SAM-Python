@@ -309,9 +309,13 @@ def validate_gps(data, gps, treatment_var, context):
     # have a score column; otherwise candidate search would silently omit that
     # arm and form lower-dimensional matched sets.
     treatment = treatment_labels(data, treatment_var)
-    missing_levels = [
-        level for level in np.unique(treatment) if level not in gps.columns
-    ]
+    # `pd.unique` hashes where `np.unique` sorts, and sorting the whole
+    # treatment column of strings costs more than everything else in this
+    # function. Only the handful of missing levels is sorted, which keeps the
+    # message below in the same order it has always been reported in.
+    missing_levels = sorted(
+        level for level in pd.unique(treatment) if level not in gps.columns
+    )
 
     if missing_levels:
         raise ValueError(
