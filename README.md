@@ -14,6 +14,12 @@ The package also provides tools for covariate-balance assessment, treatment-disc
 
 ## Installation
 
+Install the latest release from PyPI:
+
+```bash
+pip install sam-shared-anchor-matching
+```
+
 Install the package from GitHub:
 
 ```bash
