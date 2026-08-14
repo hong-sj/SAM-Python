@@ -93,6 +93,13 @@ def calc_caliper_3way(ps_used, treatment_var_values):
 # KD-tree utilities -------------------------------------------------------------
 
 
+def _distance_sq_2d(point_1, point_2):
+    """Return a squared 2D distance without allocating temporary arrays."""
+    delta_0 = point_1[0] - point_2[0]
+    delta_1 = point_1[1] - point_2[1]
+    return float(delta_0 * delta_0 + delta_1 * delta_1)
+
+
 def kdtree_build(coords, idx=None, depth=0):
     """
     Build a static two-dimensional KD-tree.
@@ -183,14 +190,14 @@ def kdtree_nearest(node, coords, query, active):
     if best is None:
         best_distance_sq = float("inf")
     else:
-        best_distance_sq = float(np.sum((coords[best] - query) ** 2))
+        best_distance_sq = _distance_sq_2d(coords[best], query)
 
     if gap * gap < best_distance_sq:
         candidate = kdtree_nearest(other, coords, query, active)
 
         if candidate is not None:
-            candidate_distance_sq = float(
-                np.sum((coords[candidate] - query) ** 2)
+            candidate_distance_sq = _distance_sq_2d(
+                coords[candidate], query
             )
 
             if candidate_distance_sq < best_distance_sq:
@@ -227,7 +234,7 @@ def kdtree_range(node, coords, query, radius2, active):
         if not active[point]:
             return []
 
-        distance_sq = float(np.sum((coords[point] - query) ** 2))
+        distance_sq = _distance_sq_2d(coords[point], query)
 
         # Boundary points are excluded by design.
         return [point] if distance_sq < radius2 else []
