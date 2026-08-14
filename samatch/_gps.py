@@ -36,7 +36,21 @@ def _fit_unregularized_multinomial_logit(
                 tol=tol,
             )
             model.fit(X_scaled, y)
-        except TypeError:
+        except TypeError as error:
+            if "penalty" not in str(error):
+                raise
+
+            # Very old scikit-learn cannot express "no penalty" this way. The
+            # fallback is regularized, which contradicts what this function
+            # promises, so it must not pass unnoticed.
+            warnings.warn(
+                "This scikit-learn version does not support penalty=None; "
+                "falling back to the default L2-regularized model. The "
+                "estimated GPS will be shrunk toward zero. Upgrade "
+                "scikit-learn to obtain unregularized estimates.",
+                RuntimeWarning,
+            )
+
             model = LogisticRegression(
                 solver="lbfgs",
                 max_iter=max_iter,

@@ -16,6 +16,7 @@ def compute_balancing_weights(
     treatment_var="T",
     anchor_level="A",
     stabilize=True,
+    trim=1e-3,
 ):
     """
     Compute propensity score balancing weights.
@@ -38,12 +39,26 @@ def compute_balancing_weights(
     stabilize : bool, default=True
         Whether to stabilize IPTW using empirical treatment prevalence.
         Ignored for overlap and matching weights.
+    trim : float, default=1e-3
+        Lower bound applied to the generalized propensity scores before
+        weights are formed. Set to 0 to disable.
 
     Returns
     -------
     dict
         Dictionary containing weights, tilting function values, weighting
-        method, and generalized propensity scores.
+        method, generalized propensity scores, and ``n_trimmed``.
+
+    Notes
+    -----
+    Weights divide by each subject's own propensity score, which is unbounded
+    as that score approaches zero. Because `estimate_gps_multinom()` fits an
+    unregularized model, near-separation can push scores arbitrarily close to
+    zero and a single subject can then dominate the weighted estimator, or
+    produce infinities that propagate silently into the balance and effective
+    sample size summaries. `trim` bounds this, and ``n_trimmed`` reports how
+    many subjects were affected -- a nonzero count is a positivity warning
+    worth investigating rather than a routine detail.
     """
     if method not in ("iptw", "overlap", "matching"):
         raise ValueError('method must be "iptw", "overlap", or "matching"')
@@ -72,8 +87,20 @@ def compute_balancing_weights(
             "Treatment group(s) not found in gps: " + ", ".join(missing_levels)
         )
 
+    if trim < 0 or trim >= 1:
+        raise ValueError("trim must be in [0, 1)")
+
     gps_values = gps.to_numpy(dtype=float)
     column_index = {column: i for i, column in enumerate(gps.columns)}
+
+    # Bound the scores away from zero before dividing by them. Left unbounded,
+    # a single near-zero score produces a weight large enough to dominate every
+    # downstream summary, or an infinity that propagates without a warning.
+    n_trimmed = int((gps_values < trim).any(axis=1).sum()) if trim > 0 else 0
+
+    if n_trimmed:
+        gps_values = np.clip(gps_values, trim, None)
+        gps_values = gps_values / gps_values.sum(axis=1, keepdims=True)
 
     own_gps = gps_values[
         np.arange(len(gps_values)),
@@ -102,6 +129,7 @@ def compute_balancing_weights(
         "h": h,
         "method": method,
         "gps": gps,
+        "n_trimmed": n_trimmed,
     }
 
 
@@ -180,6 +208,7 @@ def compute_weighted_balance(
                     "group": group,
                     "covariate": covariate,
                     "smd": smd,
+                    "smd_defined": bool(pooled_sd > 0),
                 }
             )
 
@@ -187,15 +216,15 @@ def compute_weighted_balance(
     summary_rows = []
 
     for group in groups:
-        values = by_covariate.loc[
-            by_covariate["group"] == group, "smd"
-        ].abs()
+        group_rows = by_covariate.loc[by_covariate["group"] == group]
+        values = group_rows.loc[group_rows["smd_defined"], "smd"].abs()
 
         summary_rows.append(
             {
                 "group": group,
                 "mean_abs_smd": values.mean(),
                 "max_abs_smd": values.max(),
+                "n_undefined": int((~group_rows["smd_defined"]).sum()),
             }
         )
 
@@ -263,6 +292,7 @@ def evaluate_comparator_weighting(
     treatment_var="T",
     anchor_level="A",
     stabilize=True,
+    trim=1e-3,
 ):
     """
     Evaluate a multi-arm propensity score weighting method.
@@ -286,12 +316,15 @@ def evaluate_comparator_weighting(
         Anchor treatment group.
     stabilize : bool, default=True
         Whether to stabilize IPTW.
+    trim : float, default=1e-3
+        Lower bound applied to the generalized propensity scores. Passed
+        through to `compute_balancing_weights()`.
 
     Returns
     -------
     dict
         Dictionary containing weights, GPS values, weighted balance,
-        and effective sample size.
+        effective sample size, and ``n_trimmed``.
     """
     result = compute_balancing_weights(
         data,
@@ -301,6 +334,7 @@ def evaluate_comparator_weighting(
         treatment_var=treatment_var,
         anchor_level=anchor_level,
         stabilize=stabilize,
+        trim=trim,
     )
 
     balance = compute_weighted_balance(
@@ -322,4 +356,5 @@ def evaluate_comparator_weighting(
         "gps": result["gps"],
         "balance": balance,
         "ess": ess,
+        "n_trimmed": result["n_trimmed"],
     }

@@ -247,7 +247,10 @@ weighting = samatch.evaluate_comparator_weighting(
 
 print(weighting["balance"]["summary"])
 print(weighting["ess"])
+print(weighting["n_trimmed"])
 ```
+
+Balancing weights divide by each subject's own propensity score, so a score near zero yields a weight large enough to dominate every summary that follows. Scores are therefore bounded below by `trim` (default `1e-3`, set `trim=0` to disable), and `n_trimmed` reports how many subjects were affected. A nonzero count is a positivity problem worth investigating rather than a routine detail.
 
 ---
 

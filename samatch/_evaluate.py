@@ -530,7 +530,9 @@ def sam_estimate_effects(
 
         - ``analysis_summary``: matched-cohort summary.
         - ``group_risk``: treatment-group risk estimates.
-        - ``contrasts``: anchor-referenced OR, RR, and RD estimates.
+        - ``contrasts``: anchor-referenced OR, RR, and RD estimates, with a
+          ``separation`` flag marking rows whose odds ratio is unreliable
+          because one of the two arms has no events or no non-events.
         - ``model``: fitted logistic model components.
         - ``vcov_cluster``: matched-set cluster-robust covariance matrix.
     """
@@ -632,7 +634,11 @@ def sam_estimate_effects(
     ]
     treatment_levels = [anchor_level, *comparator_levels]
 
-    # Warn when a treatment group has complete outcome separation.
+    # Warn when a treatment group has complete outcome separation, and record
+    # it so callers filtering results programmatically have something to test
+    # rather than having to catch a warning.
+    separated_levels = set()
+
     for group in treatment_levels:
         y_group = analysis_data.loc[
             analysis_data[treatment_var].astype(str) == group,
@@ -640,6 +646,7 @@ def sam_estimate_effects(
         ]
 
         if y_group.sum() == 0 or y_group.sum() == len(y_group):
+            separated_levels.add(group)
             warnings.warn(
                 f"Treatment group '{group}' has "
                 f"{int(y_group.sum())}/{len(y_group)} events. "
@@ -846,6 +853,12 @@ def sam_estimate_effects(
                 "se_RD": se_rd,
                 "RD_ci_low": rd_ci_low,
                 "RD_ci_high": rd_ci_high,
+                # The treatment-only model is saturated, so a 0/n or n/n arm
+                # drives the MLE toward infinity: OR and its interval are not
+                # trustworthy for these rows.
+                "separation": bool(
+                    separated_levels & {anchor_level, group}
+                ),
             }
         )
 

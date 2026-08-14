@@ -3,6 +3,7 @@ Mathematical utilities for Shared Anchor Matching.
 """
 
 import numpy as np
+import scipy.special
 from scipy.stats import rankdata
 
 
@@ -20,18 +21,23 @@ def expit(x):
     numpy.ndarray
         Values transformed to the interval (0, 1).
     """
-    x = np.asarray(x, dtype=float)
-    return 1.0 / (1.0 + np.exp(-x))
+    # scipy's implementation avoids the overflow that 1/(1+exp(-x)) hits for
+    # large negative x.
+    return scipy.special.expit(np.asarray(x, dtype=float))
 
 
-def logit(p):
+def logit(p, eps=0.0):
     """
     Compute the logit transformation.
 
     Parameters
     ----------
     p : array-like
-        Probabilities in the interval (0, 1).
+        Probabilities in the interval [0, 1].
+    eps : float, default=0.0
+        If positive, probabilities are clipped to ``[eps, 1 - eps]`` first,
+        so that exact zeros and ones map to finite values instead of
+        infinities.
 
     Returns
     -------
@@ -39,7 +45,11 @@ def logit(p):
         Log-odds values.
     """
     p = np.asarray(p, dtype=float)
-    return np.log(p / (1.0 - p))
+
+    if eps > 0:
+        p = np.clip(p, eps, 1 - eps)
+
+    return scipy.special.logit(p)
 
 
 def auc_mannwhitney(score, label):
