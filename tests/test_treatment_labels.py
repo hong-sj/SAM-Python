@@ -130,3 +130,55 @@ def test_string_treatment_column_is_unaffected():
     assert len(search["anchor_rows"]) == int(
         (data["treatment"] == anchor).sum()
     )
+
+
+def test_build_group_distance_matrices_accepts_the_callers_own_labels():
+    """
+    The one public function that still compared raw labels. With a numeric
+    treatment column it reported a level as absent while quoting it in the very
+    form that is present, which is the symptom this module exists to prevent.
+    """
+    frame = _numeric_treatment_frame()
+
+    fit = samatch.estimate_gps_multinom(
+        frame, X_vars=list("abc"), treatment_var="T", anchor_level=0
+    )
+    search = samatch.gps_candidate_search(
+        frame, fit["gps"], treatment_var="T", anchor_level=0, top_m=5
+    )
+
+    from_data = samatch.build_group_distance_matrices(
+        frame, list("abc"), "T", search["anchor_rows"], [1, 2]
+    )
+    from_search = samatch.build_group_distance_matrices(
+        frame, list("abc"), "T", search["anchor_rows"], search["groups"]
+    )
+
+    assert [matrix.shape for matrix in from_data["D"].values()] == [
+        matrix.shape for matrix in from_search["D"].values()
+    ]
+
+    for numeric_level, string_level in ((1, "1"), (2, "2")):
+        np.testing.assert_array_equal(
+            from_data["D"][numeric_level], from_search["D"][string_level]
+        )
+
+
+def test_an_absent_level_is_reported_distinguishably():
+    """
+    The message has to show whether the level it looked for was a string, since
+    that is exactly what the reader needs to check.
+    """
+    frame = _numeric_treatment_frame()
+
+    fit = samatch.estimate_gps_multinom(
+        frame, X_vars=list("abc"), treatment_var="T", anchor_level=0
+    )
+    search = samatch.gps_candidate_search(
+        frame, fit["gps"], treatment_var="T", anchor_level=0, top_m=5
+    )
+
+    with pytest.raises(ValueError, match=r"no rows found with T == 9"):
+        samatch.build_group_distance_matrices(
+            frame, list("abc"), "T", search["anchor_rows"], [9]
+        )

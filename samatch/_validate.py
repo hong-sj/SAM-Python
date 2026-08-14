@@ -62,8 +62,11 @@ def require_rows(rows, level, treatment_var):
     an empty matched set.
     """
     if len(rows) == 0:
+        # `!r` rather than explicit quotes: the whole point of this message is
+        # that levels are compared as strings, which is impossible to see if a
+        # numeric level is rendered as though it were already one.
         raise ValueError(
-            f"no rows found with {treatment_var} == '{level}'. "
+            f"no rows found with {treatment_var} == {level!r}. "
             "Treatment levels are compared as strings; check that the level "
             "matches the values in the treatment column."
         )

@@ -6,7 +6,12 @@ import warnings
 
 import numpy as np
 
-from ._validate import covariate_matrix, require_rows, treatment_labels
+from ._validate import (
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+)
 
 
 def get_pooled_covariance(data, X_vars=None, treatment_var="T"):
@@ -186,9 +191,13 @@ def build_group_distance_matrices(
 
     treatment = treatment_labels(data, treatment_var)
 
+    # Comparison goes through treatment_level() for the same reason every other
+    # call site does: treatment labels are canonicalised to strings, so a raw
+    # numeric group label would match no rows and report a level as absent that
+    # is in fact present.
     group_rows = {
         group: require_rows(
-            np.flatnonzero(treatment == group),
+            np.flatnonzero(treatment == treatment_level(group)),
             group,
             treatment_var,
         )
