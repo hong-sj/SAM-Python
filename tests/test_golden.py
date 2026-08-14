@@ -48,7 +48,15 @@ ESTIMATE_TABLES = {
 DECISION_TABLES = {"four": ["matched"], "three": ["matched"]}
 
 STRICT = dict(rtol=1e-9, atol=1e-12)
-LOOSE = dict(rtol=1e-3, atol=1e-8)
+
+# Off the reference environment the loose tier exists to catch a gross
+# regression -- a sign flip, a shifted formula -- not solver drift. It needs an
+# absolute floor as well as a relative one, because these tables hold
+# standardized mean differences and probabilities, and a value near zero makes
+# relative error meaningless: scikit-learn 1.6.1 vs 1.8.0 moves an SMD of
+# -0.0165 by 4.8e-05, which is 0.3% relatively but 2,000x below the 0.1
+# threshold anyone reads an SMD against.
+LOOSE = dict(rtol=1e-3, atol=1e-3)
 
 
 @pytest.fixture(scope="module")
