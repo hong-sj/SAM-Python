@@ -1,6 +1,7 @@
 # SAM-Python
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21926925.svg)](https://doi.org/10.5281/zenodo.21926925)
+[![CI](https://github.com/hong-sj/SAM-Python/actions/workflows/ci.yml/badge.svg)](https://github.com/hong-sj/SAM-Python/actions/workflows/ci.yml)
 
 ## Shared Anchor Matching: A Scalable Matching Framework for Multiple Treatment Groups
 

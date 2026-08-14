@@ -112,6 +112,34 @@ def test_invalid_trim_raises(four_group, trim):
         )
 
 
+def test_weighted_balance_with_uniform_weights_equals_unweighted(four_group):
+    """Uniform weights must reproduce the plain group means and variances."""
+    data, covariates, anchor, _ = four_group
+
+    balance = samatch.compute_weighted_balance(
+        data,
+        np.ones(len(data)),
+        X_vars=covariates,
+        treatment_var="treatment",
+        anchor_level=anchor,
+    )
+
+    treatment = data["treatment"].astype(str).to_numpy()
+    anchor_mask = treatment == anchor
+
+    for _, row in balance["by_covariate"].iterrows():
+        x = data[row["covariate"]].to_numpy(dtype=float)
+        group_mask = treatment == row["group"]
+
+        # compute_weighted_balance uses the population variance (ddof=0).
+        pooled_sd = np.sqrt(
+            (x[anchor_mask].var(ddof=0) + x[group_mask].var(ddof=0)) / 2
+        )
+        expected = (x[anchor_mask].mean() - x[group_mask].mean()) / pooled_sd
+
+        assert row["smd"] == pytest.approx(expected)
+
+
 def test_evaluate_comparator_weighting_reports_trimming(four_group):
     data, covariates, anchor, fit = four_group
 

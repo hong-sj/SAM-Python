@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest interpreters pyproject.toml claims to support,
+        # plus one in between. The dependency floors resolve very differently
+        # across this range, so all three are worth running.
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Show resolved dependency versions
+        run: python -m pip list
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  minimum-dependencies:
+    # The floors declared in pyproject.toml are only meaningful if something
+    # actually installs them.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install with the declared minimum versions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          python -m pip install \
+            "numpy==1.23.*" "pandas==1.5.*" "scipy==1.9.*" "scikit-learn==1.2.*"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
