@@ -341,19 +341,41 @@ def check_data_fingerprint(search, data, treatment_var, context):
         treatment_var,
         columns=expected.get("data_columns", list(data.columns)),
     )
-    common_keys = ("n_rows", "index_hash", "treatment_hash")
-    mismatch = any(actual.get(key) != expected.get(key) for key in common_keys)
 
-    if "data_hash" in expected:
-        mismatch = mismatch or actual["data_hash"] != expected["data_hash"]
+    # Naming the part that moved matters: the values hash also trips on an edit
+    # to a column matching never touched, and a caller told only that they
+    # "re-sorted or filtered" would go looking for something they never did.
+    checks = [
+        (
+            "n_rows",
+            f"the row count changed ({expected.get('n_rows')} -> "
+            f"{actual['n_rows']}); rows were added or dropped",
+        ),
+        ("index_hash", "the index changed; it was re-ordered or re-indexed"),
+        (
+            "treatment_hash",
+            "the treatment column changed; rows were re-ordered or recoded",
+        ),
+        (
+            "data_hash",
+            "a column value changed; note that this covers every column "
+            "present at search time, including ones matching does not use",
+        ),
+    ]
 
-    if mismatch:
+    reasons = [
+        reason
+        for key, reason in checks
+        if key in expected and actual.get(key) != expected.get(key)
+    ]
+
+    if reasons:
         raise ValueError(
             f"the data passed to {context}() does not match the data used by "
-            "gps_candidate_search(). Matched sets reference positional row "
-            "indices, so the same DataFrame must be passed unmodified through "
-            "the whole pipeline; re-sorting, filtering or re-indexing in "
-            "between silently changes which subjects the results describe."
+            "gps_candidate_search(): "
+            + "; ".join(reasons)
+            + ". Matched sets reference positional row indices, so the same "
+            "DataFrame must be passed unmodified through the whole pipeline."
         )
 
 

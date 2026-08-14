@@ -235,3 +235,72 @@ def test_mixed_anchor_rows_are_reported(pipeline):
         samatch.extract_matched_data(
             shuffled, legacy, matched, treatment_var="T"
         )
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        (lambda f: f.iloc[:-1], "row count changed"),
+        (lambda f: f.sort_values("a"), "index changed"),
+        (lambda f: f.assign(T=f["T"].str.lower()), "treatment column changed"),
+        (lambda f: f.assign(a=f["a"].round(3)), "column value changed"),
+    ],
+)
+def test_the_rejection_names_what_moved(pipeline, mutate, expected):
+    """
+    The values hash also trips on an edit to a column matching never uses, so a
+    message that only says "re-sorted or filtered" sends the reader looking for
+    something they did not do. Each axis has to be reported on its own.
+    """
+    frame, fit, search, matched = pipeline
+
+    with pytest.raises(ValueError, match=expected):
+        samatch.sam_evaluate(
+            mutate(frame),
+            search,
+            matched,
+            fit["gps"],
+            X_vars=list("abc"),
+            treatment_var="T",
+        )
+
+
+def test_editing_an_unused_column_says_so_rather_than_blaming_the_row_order():
+    """
+    Recoding a column nothing in the pipeline reads is still rejected -- the
+    full-row hash is what catches two same-treatment subjects being swapped --
+    but it must be reported as a value change, not as a re-ordering.
+    """
+    rng = np.random.default_rng(4)
+    frame = pd.DataFrame(rng.normal(size=(120, 3)), columns=list("abc"))
+    frame["T"] = rng.choice(list("ABC"), 120)
+    frame["subject_id"] = np.arange(120)
+
+    fit = samatch.estimate_gps_multinom(
+        frame, X_vars=list("abc"), treatment_var="T", anchor_level="A"
+    )
+    search = samatch.gps_candidate_search(
+        frame, fit["gps"], treatment_var="T", anchor_level="A", top_m=5
+    )
+    matched = samatch.sam_match(
+        frame, search, X_vars=list("abc"), treatment_var="T"
+    )
+
+    recoded = frame.assign(subject_id=frame["subject_id"].astype(str))
+
+    with pytest.raises(ValueError) as error:
+        samatch.sam_evaluate(
+            recoded,
+            search,
+            matched,
+            fit["gps"],
+            X_vars=list("abc"),
+            treatment_var="T",
+        )
+
+    message = str(error.value)
+
+    assert "column value changed" in message
+    assert "including ones matching does not use" in message
+    assert "row count changed" not in message
+    assert "index changed" not in message
