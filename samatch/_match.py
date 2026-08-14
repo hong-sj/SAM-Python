@@ -9,6 +9,7 @@ import pandas as pd
 
 from ._mahalanobis import get_pooled_covariance, mahalanobis_distance_matrix
 from ._validate import (
+    check_data_fingerprint,
     covariate_matrix,
     require_rows,
     treatment_labels,
@@ -54,6 +55,8 @@ def sam_match(
     """
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
+
+    check_data_fingerprint(search, data, treatment_var, "sam_match")
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
     groups = list(search["groups"])

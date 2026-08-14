@@ -10,6 +10,7 @@ import numpy as np
 from scipy.special import logit as _qlogis
 
 from ._validate import (
+    data_fingerprint,
     require_positive_int,
     require_rows,
     treatment_labels,
@@ -58,6 +59,15 @@ def gps_candidate_search(
         - ``groups``: comparator treatment groups.
         - ``candidates``: candidate row indices for each anchor and
           comparator group.
+        - ``data_fingerprint``: identifies the frame these positional indices
+          refer to, so later stages can reject a modified `data`.
+
+    Notes
+    -----
+    The returned row indices are positional. The same DataFrame must be
+    passed unmodified to `sam_match()`, `sam_evaluate()` and
+    `extract_matched_data()`; re-sorting or filtering it in between would
+    repoint those indices at different subjects.
     """
     if gps_space not in ("raw", "logit"):
         raise ValueError('gps_space must be "raw" or "logit"')
@@ -127,6 +137,7 @@ def gps_candidate_search(
 
     return {
         "anchor_rows": anchor_rows,
+        "data_fingerprint": data_fingerprint(data, treatment_var),
         "groups": groups,
         "candidates": candidates,
     }

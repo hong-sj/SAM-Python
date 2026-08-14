@@ -7,6 +7,8 @@ made its own assumptions, which allowed a mismatch to pass through silently
 and produce an empty or wrong result rather than an error.
 """
 
+import hashlib
+
 import numpy as np
 import pandas as pd
 
@@ -145,3 +147,59 @@ def require_positive_int(value, name):
         raise ValueError(f"{name} must be a positive integer, got {value}")
 
     return int(value)
+
+
+def _ordered_hash(values):
+    """Return an order-sensitive digest of a 1-D sequence."""
+    codes = pd.util.hash_pandas_object(
+        pd.Series(np.asarray(values)),
+        index=False,
+    ).to_numpy()
+
+    return hashlib.blake2b(codes.tobytes(), digest_size=16).hexdigest()
+
+
+def data_fingerprint(data, treatment_var):
+    """
+    Return a cheap fingerprint identifying the exact frame used for matching.
+
+    Matched sets are stored as *positional* row indices, so every stage after
+    `gps_candidate_search()` must be handed the same frame in the same order.
+    Re-sorting or filtering in between silently repoints those indices at
+    different subjects.
+
+    Both the index and the treatment column are hashed order-sensitively.
+    Hashing the index alone would miss a reordering followed by
+    `reset_index(drop=True)`; hashing the treatment column alone would miss a
+    reordering within a treatment group. Other columns are deliberately not
+    hashed, so adding an outcome column between stages stays legal.
+    """
+    return {
+        "n_rows": int(len(data)),
+        "index_hash": _ordered_hash(data.index),
+        "treatment_hash": _ordered_hash(data[treatment_var].astype(str)),
+    }
+
+
+def check_data_fingerprint(search, data, treatment_var, context):
+    """
+    Verify `data` is the frame the candidate search was built from.
+
+    Silently accepts a `search` dict without a fingerprint so that objects
+    pickled by earlier versions still work.
+    """
+    expected = search.get("data_fingerprint") if hasattr(search, "get") else None
+
+    if expected is None or treatment_var not in data.columns:
+        return
+
+    actual = data_fingerprint(data, treatment_var)
+
+    if actual != expected:
+        raise ValueError(
+            f"the data passed to {context}() does not match the data used by "
+            "gps_candidate_search(). Matched sets reference positional row "
+            "indices, so the same DataFrame must be passed unmodified through "
+            "the whole pipeline; re-sorting, filtering or re-indexing in "
+            "between silently changes which subjects the results describe."
+        )

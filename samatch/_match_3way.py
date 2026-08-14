@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import logit as _qlogis
 
-from ._validate import require_positive_int
+from ._validate import check_data_fingerprint, require_positive_int
 
 
 def calc_caliper_3way(ps_used, treatment_var_values):
@@ -287,6 +287,8 @@ def match_3way(
 
     if len(gps) != len(data):
         raise ValueError("gps and data must contain the same number of rows")
+
+    check_data_fingerprint(search, data, treatment_var, "match_3way")
 
     top_n = require_positive_int(top_n, "top_n")
 

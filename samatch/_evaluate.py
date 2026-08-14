@@ -12,6 +12,28 @@ from ._diagnostics import (
     compute_pairwise_treatment_auc,
     compute_smd_balance,
 )
+from ._validate import check_data_fingerprint
+
+
+def _infer_anchor_level(data, anchor_rows, treatment_var):
+    """
+    Determine the anchor treatment level from the anchor rows.
+
+    Every anchor row must carry the same treatment label; reading only the
+    first one would silently accept a mismatched `data`/`search` pair.
+    """
+    anchor_values = pd.unique(data.iloc[anchor_rows][treatment_var].astype(str))
+
+    if len(anchor_values) != 1:
+        raise ValueError(
+            "Could not uniquely determine `anchor_level` from "
+            "`search['anchor_rows']`: found "
+            + ", ".join(map(repr, anchor_values[:5]))
+            + ". This usually means `data` is not the frame the candidate "
+            "search was built from."
+        )
+
+    return str(anchor_values[0])
 
 
 def _loss_dist_of(x):
@@ -83,11 +105,13 @@ def sam_evaluate(
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
+    check_data_fingerprint(search, data, treatment_var, "sam_evaluate")
+
     groups = search["groups"]
     matched = match_result["matched"]
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
-    anchor_level = str(data.iloc[anchor_rows[0]][treatment_var])
+    anchor_level = _infer_anchor_level(data, anchor_rows, treatment_var)
 
     loss_values = matched["loss"].to_numpy() if len(matched) else []
     loss_distribution = _loss_dist_of(loss_values)
@@ -166,6 +190,8 @@ def extract_matched_data(
     if treatment_var not in data.columns:
         raise ValueError(f"Treatment column not found: {treatment_var}")
 
+    check_data_fingerprint(search, data, treatment_var, "extract_matched_data")
+
     matched = match_result["matched"]
     groups = list(search["groups"])
 
@@ -185,18 +211,11 @@ def extract_matched_data(
 
     # Determine the anchor treatment level.
     if anchor_level is None:
-        anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
-        anchor_values = pd.unique(
-            data.iloc[anchor_rows][treatment_var].astype(str)
+        anchor_level = _infer_anchor_level(
+            data,
+            np.asarray(search["anchor_rows"], dtype=int),
+            treatment_var,
         )
-
-        if len(anchor_values) != 1:
-            raise ValueError(
-                "Could not uniquely determine `anchor_level` from "
-                "`search['anchor_rows']`."
-            )
-
-        anchor_level = str(anchor_values[0])
     else:
         anchor_level = str(anchor_level)
 
