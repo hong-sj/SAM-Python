@@ -12,6 +12,33 @@ from ._diagnostics import (
     compute_pairwise_treatment_auc,
     compute_smd_balance,
 )
+from ._utils_math import expit
+from ._validate import (
+    check_data_fingerprint,
+    check_gps_fingerprint,
+    validate_gps,
+)
+
+
+def _infer_anchor_level(data, anchor_rows, treatment_var):
+    """
+    Determine the anchor treatment level from the anchor rows.
+
+    Every anchor row must carry the same treatment label; reading only the
+    first one would silently accept a mismatched `data`/`search` pair.
+    """
+    anchor_values = pd.unique(data.iloc[anchor_rows][treatment_var].astype(str))
+
+    if len(anchor_values) != 1:
+        raise ValueError(
+            "Could not uniquely determine `anchor_level` from "
+            "`search['anchor_rows']`: found "
+            + ", ".join(map(repr, anchor_values[:5]))
+            + ". This usually means `data` is not the frame the candidate "
+            "search was built from."
+        )
+
+    return str(anchor_values[0])
 
 
 def _loss_dist_of(x):
@@ -83,11 +110,15 @@ def sam_evaluate(
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
+    check_data_fingerprint(search, data, treatment_var, "sam_evaluate")
+    validate_gps(data, gps, treatment_var, "sam_evaluate")
+    check_gps_fingerprint(search, gps, "sam_evaluate")
+
     groups = search["groups"]
     matched = match_result["matched"]
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
-    anchor_level = str(data.iloc[anchor_rows[0]][treatment_var])
+    anchor_level = _infer_anchor_level(data, anchor_rows, treatment_var)
 
     loss_values = matched["loss"].to_numpy() if len(matched) else []
     loss_distribution = _loss_dist_of(loss_values)
@@ -166,6 +197,8 @@ def extract_matched_data(
     if treatment_var not in data.columns:
         raise ValueError(f"Treatment column not found: {treatment_var}")
 
+    check_data_fingerprint(search, data, treatment_var, "extract_matched_data")
+
     matched = match_result["matched"]
     groups = list(search["groups"])
 
@@ -185,18 +218,11 @@ def extract_matched_data(
 
     # Determine the anchor treatment level.
     if anchor_level is None:
-        anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
-        anchor_values = pd.unique(
-            data.iloc[anchor_rows][treatment_var].astype(str)
+        anchor_level = _infer_anchor_level(
+            data,
+            np.asarray(search["anchor_rows"], dtype=int),
+            treatment_var,
         )
-
-        if len(anchor_values) != 1:
-            raise ValueError(
-                "Could not uniquely determine `anchor_level` from "
-                "`search['anchor_rows']`."
-            )
-
-        anchor_level = str(anchor_values[0])
     else:
         anchor_level = str(anchor_level)
 
@@ -209,26 +235,19 @@ def extract_matched_data(
     else:
         set_ids = np.arange(1, len(matched) + 1, dtype=int)
 
-    # Expand matched sets into subject-level records.
-    index_rows = []
+    # Expand matched sets into subject-level records. Reshaping the whole block
+    # at once rather than looping: `matched.iloc[i][column]` builds a fresh row
+    # Series per access, which made this step cost as much as the match itself.
+    subject_rows = matched[["anchor", *groups]].to_numpy(dtype=int)
 
-    for i in range(len(matched)):
-        subject_rows = [
-            int(matched.iloc[i]["anchor"]),
-            *[int(matched.iloc[i][group]) for group in groups],
-        ]
-
-        for role, subject_row in zip(treatment_order, subject_rows):
-            index_rows.append(
-                {
-                    "matched_set_id": set_ids[i],
-                    "matched_role": role,
-                    "original_row": subject_row,
-                }
-            )
-
-    matched_index = pd.DataFrame(index_rows)
-    original_rows = matched_index["original_row"].to_numpy(dtype=int)
+    original_rows = subject_rows.reshape(-1)
+    matched_index = pd.DataFrame(
+        {
+            "matched_set_id": np.repeat(set_ids, k),
+            "matched_role": np.tile(np.asarray(treatment_order, dtype=object), len(matched)),
+            "original_row": original_rows,
+        }
+    )
 
     if np.any(original_rows < 0) or np.any(original_rows >= len(data)):
         raise ValueError(
@@ -263,24 +282,36 @@ def extract_matched_data(
     )
 
     # Each matched set must contain exactly one subject per treatment group.
-    set_sizes = matched_data.groupby(
-        "matched_set_id",
-        sort=False,
-    ).size()
+    #
+    # Both counts are integer tabulations, so they are done with `bincount`
+    # rather than `groupby`/`crosstab`: crosstab aggregates cell by cell in
+    # pure Python, which on a 20,000-row cohort was 93% of the cost of this
+    # whole function.
+    set_codes, unique_sets = pd.factorize(matched_data["matched_set_id"])
+    n_sets = len(unique_sets)
 
-    if not np.all(set_sizes.to_numpy() == k):
+    set_sizes = np.bincount(set_codes, minlength=n_sets)
+
+    if not np.all(set_sizes == k):
         raise ValueError(
             f"At least one matched set does not contain exactly {k} subjects."
         )
 
-    count_table = pd.crosstab(
-        matched_data["matched_set_id"],
-        matched_data[treatment_var].astype(str),
+    # A label outside `treatment_order` indexes to -1; those are collected in a
+    # (k+1)-th bucket so that they still fail the one-per-group check below,
+    # exactly as the extra crosstab column used to.
+    role_codes = pd.Index(treatment_order).get_indexer(
+        matched_data[treatment_var].astype(str)
     )
+    bucket_codes = np.where(role_codes < 0, k, role_codes)
+
+    observed = np.zeros(k + 1, dtype=bool)
+    observed[bucket_codes] = True
 
     missing_groups = [
-        group for group in treatment_order
-        if group not in count_table.columns
+        group
+        for index, group in enumerate(treatment_order)
+        if not observed[index]
     ]
 
     if missing_groups:
@@ -289,7 +320,12 @@ def extract_matched_data(
             + ", ".join(missing_groups)
         )
 
-    if not np.all(count_table[treatment_order].to_numpy() == 1):
+    cell_counts = np.bincount(
+        set_codes * (k + 1) + bucket_codes,
+        minlength=n_sets * (k + 1),
+    ).reshape(n_sets, k + 1)
+
+    if not np.all(cell_counts[:, :k] == 1):
         raise ValueError(
             "Each matched set must contain exactly one subject "
             "from every treatment group."
@@ -364,7 +400,7 @@ def _fit_treatment_only_logistic(
 
     for _ in range(max_iter):
         eta = X @ beta
-        mu = 1.0 / (1.0 + np.exp(-eta))
+        mu = expit(eta)
         weights = mu * (1 - mu)
 
         score = X.T @ (y - mu)
@@ -384,7 +420,7 @@ def _fit_treatment_only_logistic(
 
         beta = beta_new
 
-    mu = 1.0 / (1.0 + np.exp(-(X @ beta)))
+    mu = expit(X @ beta)
 
     return {
         "beta": beta,
@@ -420,12 +456,20 @@ def _cluster_robust_vcov(fit, cluster):
         bread = np.linalg.pinv(xtwx)
 
     score_i = X * (y - mu)[:, None]
-    unique_clusters = pd.unique(cluster)
 
-    score_cluster = np.vstack(
+    # Accumulate per-cluster scores with a scatter-add. Masking the full score
+    # matrix once per cluster would be quadratic here, since SAM produces one
+    # matched set per anchor and so the cluster count grows with the sample.
+    codes, unique_clusters = pd.factorize(cluster)
+
+    score_cluster = np.column_stack(
         [
-            score_i[cluster == cluster_id].sum(axis=0)
-            for cluster_id in unique_clusters
+            np.bincount(
+                codes,
+                weights=score_i[:, column],
+                minlength=len(unique_clusters),
+            )
+            for column in range(X.shape[1])
         ]
     )
 
@@ -503,7 +547,9 @@ def sam_estimate_effects(
 
         - ``analysis_summary``: matched-cohort summary.
         - ``group_risk``: treatment-group risk estimates.
-        - ``contrasts``: anchor-referenced OR, RR, and RD estimates.
+        - ``contrasts``: anchor-referenced OR, RR, and RD estimates, with a
+          ``separation`` flag marking rows whose odds ratio is unreliable
+          because one of the two arms has no events or no non-events.
         - ``model``: fitted logistic model components.
         - ``vcov_cluster``: matched-set cluster-robust covariance matrix.
     """
@@ -605,7 +651,11 @@ def sam_estimate_effects(
     ]
     treatment_levels = [anchor_level, *comparator_levels]
 
-    # Warn when a treatment group has complete outcome separation.
+    # Warn when a treatment group has complete outcome separation, and record
+    # it so callers filtering results programmatically have something to test
+    # rather than having to catch a warning.
+    separated_levels = set()
+
     for group in treatment_levels:
         y_group = analysis_data.loc[
             analysis_data[treatment_var].astype(str) == group,
@@ -613,6 +663,7 @@ def sam_estimate_effects(
         ]
 
         if y_group.sum() == 0 or y_group.sum() == len(y_group):
+            separated_levels.add(group)
             warnings.warn(
                 f"Treatment group '{group}' has "
                 f"{int(y_group.sum())}/{len(y_group)} events. "
@@ -664,13 +715,9 @@ def sam_estimate_effects(
             np.sqrt(x_group @ vcov_cluster @ x_group)
         )
 
-        risk = 1.0 / (1.0 + np.exp(-eta_group))
-        risk_ci_low = 1.0 / (
-            1.0 + np.exp(-(eta_group - z_value * se_eta_group))
-        )
-        risk_ci_high = 1.0 / (
-            1.0 + np.exp(-(eta_group + z_value * se_eta_group))
-        )
+        risk = expit(eta_group)
+        risk_ci_low = expit(eta_group - z_value * se_eta_group)
+        risk_ci_high = expit(eta_group + z_value * se_eta_group)
 
         is_group = (
             analysis_data[treatment_var].astype(str) == group
@@ -698,11 +745,10 @@ def sam_estimate_effects(
         coef_j = coef_index[coef_name]
 
         def risk_anchor_fun(b):
-            return 1.0 / (1.0 + np.exp(-b[0]))
+            return expit(b[0])
 
         def risk_comparator_fun(b):
-            eta = b[0] + b[coef_j]
-            return 1.0 / (1.0 + np.exp(-eta))
+            return expit(b[0] + b[coef_j])
 
         def log_or_fun(b):
             return float(b[coef_j])
@@ -819,6 +865,12 @@ def sam_estimate_effects(
                 "se_RD": se_rd,
                 "RD_ci_low": rd_ci_low,
                 "RD_ci_high": rd_ci_high,
+                # The treatment-only model is saturated, so a 0/n or n/n arm
+                # drives the MLE toward infinity: OR and its interval are not
+                # trustworthy for these rows.
+                "separation": bool(
+                    separated_levels & {anchor_level, group}
+                ),
             }
         )
 

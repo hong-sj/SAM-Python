@@ -7,7 +7,19 @@ import heapq
 import numpy as np
 import pandas as pd
 
-from ._mahalanobis import get_pooled_covariance, mahalanobis_distance_matrix
+from ._mahalanobis import get_pooled_covariance
+from ._match_common import (
+    build_matched_frame,
+    max_possible_rate,
+    summarize_matching,
+)
+from ._validate import (
+    check_data_fingerprint,
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+)
 
 
 def sam_match(
@@ -45,21 +57,22 @@ def sam_match(
         - ``unmatched_anchor_rows``: row indices of unmatched anchors.
         - ``matching_rate``: proportion of anchor subjects successfully
           matched.
+        - ``max_possible_rate``: the highest rate the group sizes allow.
+
+    Notes
+    -----
+    Every matched set consumes one subject from each comparator group, so
+    ``matching_rate`` cannot exceed the size of the smallest comparator group
+    divided by the anchor count. Compare it against ``max_possible_rate``
+    before reading a low rate as a poor match.
     """
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
-    if treatment_var not in data.columns:
-        raise ValueError(f"'{treatment_var}' not found in data")
-
-    missing_covariates = [
-        covariate for covariate in X_vars if covariate not in data.columns
-    ]
-    if missing_covariates:
-        raise ValueError(
-            "Covariate column(s) not found in data: "
-            + ", ".join(missing_covariates)
-        )
+    # Preserve the specific, actionable covariate error when a caller both
+    # changes a value and makes it unusable (for example by inserting NaN).
+    X = covariate_matrix(data, X_vars)
+    check_data_fingerprint(search, data, treatment_var, "sam_match")
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
     groups = list(search["groups"])
@@ -69,58 +82,88 @@ def sam_match(
     pooled = get_pooled_covariance(data, X_vars, treatment_var)
     s_inv = pooled["S_inv"]
 
-    treatment = data[treatment_var].to_numpy()
+    treatment = treatment_labels(data, treatment_var)
     group_rows = {
-        group: np.flatnonzero(treatment == group)
+        group: require_rows(
+            np.flatnonzero(treatment == treatment_level(group)),
+            group,
+            treatment_var,
+        )
         for group in groups
     }
 
-    x_anchor = data.iloc[anchor_rows][X_vars].to_numpy(dtype=float)
-    x_group = {
-        group: data.iloc[group_rows[group]][X_vars].to_numpy(dtype=float)
-        for group in groups
-    }
+    # Materialise the covariates once and slice with numpy rather than
+    # rebuilding an intermediate DataFrame per group.
+    x_anchor = X[anchor_rows]
+    x_group = {group: X[group_rows[group]] for group in groups}
 
     # Convert global candidate rows to within-group positions and calculate
     # Mahalanobis distances only for GPS-screened candidates.
-    local_position = {
-        group: {
-            row: position
-            for position, row in enumerate(group_rows[group])
-        }
-        for group in groups
-    }
+    #
+    # Every screened pair of a group is done in one pass. This is the same
+    # expanded form `mahalanobis_distance_matrix()` uses -- squared norms under
+    # S_inv minus twice the cross term, clamped at zero -- but calling that
+    # function once per anchor spent most of this loop dispatching numpy over
+    # one-row queries: at n = 20,000 it was 17,316 calls and 38% of this
+    # function. The cross term stays a row-wise dot product over the screened
+    # pairs rather than an anchor-by-group matrix, whose 32M entries are what
+    # made the original full-matrix implementation run out of memory.
+    anchor_transformed = x_anchor @ s_inv
+    anchor_sq = np.sum(anchor_transformed * x_anchor, axis=1)
 
-    candidate_local = {group: [] for group in groups}
-    candidate_distance = {group: [] for group in groups}
+    candidate_local = {}
+    candidate_distance = {}
 
     for group in groups:
-        for i in range(n_anchor):
-            local_indices = np.asarray(
-                [
-                    local_position[group][row]
-                    for row in candidates[i][group]
-                    if row in local_position[group]
-                ],
-                dtype=int,
-            )
+        rows_of_group = group_rows[group]
 
-            if len(local_indices) == 0:
-                candidate_local[group].append(local_indices)
-                candidate_distance[group].append(np.array([], dtype=float))
-                continue
+        position_in_group = np.full(len(data), -1, dtype=int)
+        position_in_group[rows_of_group] = np.arange(len(rows_of_group))
 
-            distances = mahalanobis_distance_matrix(
-                x_anchor[i : i + 1],
-                x_group[group][local_indices],
-                s_inv,
-            )[0]
+        per_anchor = [
+            position_in_group[np.asarray(candidates[i][group], dtype=int)]
+            for i in range(n_anchor)
+        ]
+        per_anchor = [
+            positions[positions >= 0] for positions in per_anchor
+        ]
 
-            # Stable sorting preserves deterministic tie handling.
-            order = np.argsort(distances, kind="stable")
+        counts = np.fromiter(
+            (len(positions) for positions in per_anchor),
+            dtype=int,
+            count=n_anchor,
+        )
+        flat_candidate = (
+            np.concatenate(per_anchor)
+            if n_anchor
+            else np.empty(0, dtype=int)
+        )
+        flat_anchor = np.repeat(np.arange(n_anchor), counts)
 
-            candidate_local[group].append(local_indices[order])
-            candidate_distance[group].append(distances[order])
+        x_this_group = x_group[group]
+        group_transformed = x_this_group @ s_inv
+        group_sq = np.sum(group_transformed * x_this_group, axis=1)
+
+        cross = np.sum(
+            anchor_transformed[flat_anchor] * x_this_group[flat_candidate],
+            axis=1,
+        )
+        distance_sq = anchor_sq[flat_anchor] + group_sq[flat_candidate] - 2 * cross
+
+        # Guard against small negative values from floating-point error.
+        distance_sq[distance_sq < 0] = 0.0
+        flat_distance = np.sqrt(distance_sq)
+
+        # One global ordering in place of a stable sort per anchor. Within an
+        # anchor's contiguous block, ranking by position is the same tie-break
+        # a per-anchor stable sort applies, so the permutation is unchanged.
+        order = np.lexsort(
+            (np.arange(len(flat_distance)), flat_distance, flat_anchor)
+        )
+        boundaries = np.cumsum(counts)[:-1]
+
+        candidate_local[group] = np.split(flat_candidate[order], boundaries)
+        candidate_distance[group] = np.split(flat_distance[order], boundaries)
 
     active = {
         group: np.ones(len(group_rows[group]), dtype=bool)
@@ -146,8 +189,28 @@ def sam_match(
     version = np.zeros(n_anchor, dtype=np.int64)
     heap = []
 
+    # Reverse index: which anchors currently have their best match pointing at
+    # a given comparator subject. Without it, consuming a subject would mean
+    # rescanning every remaining anchor to find the few that were relying on
+    # it, which is quadratic in the anchor count.
+    claimants = {
+        group: [set() for _ in range(len(group_rows[group]))]
+        for group in groups
+    }
+
+    def release(i):
+        """Drop anchor `i`'s outstanding claims on comparator subjects."""
+        for group in groups:
+            chosen = int(best_choice[group][i])
+
+            if chosen >= 0:
+                claimants[group][chosen].discard(i)
+                best_choice[group][i] = -1
+
     def recompute(i):
         """Recompute the current best available match for one anchor."""
+        release(i)
+
         total_loss = 0.0
 
         for group in groups:
@@ -164,16 +227,19 @@ def sam_match(
             pointer[group][i] = position
 
             if position >= len(local_indices):
+                release(i)
                 best_loss[i] = np.inf
 
                 for other_group in groups:
-                    best_choice[other_group][i] = -1
                     best_distance[other_group][i] = np.nan
 
                 version[i] += 1
                 return
 
-            best_choice[group][i] = int(local_indices[position])
+            chosen = int(local_indices[position])
+
+            best_choice[group][i] = chosen
+            claimants[group][chosen].add(i)
             best_distance[group][i] = float(distances[position])
             total_loss += float(distances[position])
 
@@ -234,53 +300,33 @@ def sam_match(
         anchor_active[anchor_idx] = False
         n_active_anchor -= 1
 
+        affected = set()
+
         for group in groups:
             active[group][choice[group]] = False
+            affected |= claimants[group][choice[group]]
+
+        release(anchor_idx)
+        affected.discard(anchor_idx)
 
         if n_active_anchor == 0:
             break
 
         # Only anchors using one of the newly assigned comparator subjects
-        # need to have their current best match recomputed.
-        remaining_anchors = np.flatnonzero(anchor_active)
+        # need to have their current best match recomputed. Sorting keeps the
+        # order independent of set iteration order.
+        for i in sorted(affected):
+            if anchor_active[i]:
+                recompute(i)
 
-        for i in remaining_anchors:
-            if any(
-                int(best_choice[group][i]) == choice[group]
-                for group in groups
-            ):
-                recompute(int(i))
-
-    if matched_rows:
-        matched = pd.DataFrame(matched_rows)
-    else:
-        columns = [
-            "matched_set_id",
-            "anchor",
-            *groups,
-            *[f"dist_{group}" for group in groups],
-            "loss",
-        ]
-        matched = pd.DataFrame(columns=columns)
-
-    if len(matched) > 0:
-        matched_anchor_rows = set(matched["anchor"].tolist())
-    else:
-        matched_anchor_rows = set()
-
-    unmatched_anchor_rows = np.asarray(
-        [
-            row
-            for row in anchor_rows
-            if row not in matched_anchor_rows
-        ],
-        dtype=int,
+    matched = build_matched_frame(matched_rows, groups)
+    unmatched_anchor_rows, matching_rate = summarize_matching(
+        matched, anchor_rows
     )
-
-    matching_rate = len(matched) / n_anchor if n_anchor > 0 else float("nan")
 
     return {
         "matched": matched,
         "unmatched_anchor_rows": unmatched_anchor_rows,
         "matching_rate": matching_rate,
+        "max_possible_rate": max_possible_rate(group_rows, anchor_rows),
     }

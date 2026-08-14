@@ -6,6 +6,13 @@ import numpy as np
 import pandas as pd
 
 from ._gps import estimate_gps_multinom
+from ._validate import (
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+    validate_gps,
+)
 
 
 def compute_balancing_weights(
@@ -16,6 +23,7 @@ def compute_balancing_weights(
     treatment_var="T",
     anchor_level="A",
     stabilize=True,
+    trim=1e-3,
 ):
     """
     Compute propensity score balancing weights.
@@ -38,18 +46,29 @@ def compute_balancing_weights(
     stabilize : bool, default=True
         Whether to stabilize IPTW using empirical treatment prevalence.
         Ignored for overlap and matching weights.
+    trim : float, default=1e-3
+        Lower bound applied to the generalized propensity scores before
+        weights are formed. Set to 0 to disable.
 
     Returns
     -------
     dict
         Dictionary containing weights, tilting function values, weighting
-        method, and generalized propensity scores.
+        method, generalized propensity scores, and ``n_trimmed``.
+
+    Notes
+    -----
+    Weights divide by each subject's own propensity score, which is unbounded
+    as that score approaches zero. Because `estimate_gps_multinom()` fits an
+    unregularized model, near-separation can push scores arbitrarily close to
+    zero and a single subject can then dominate the weighted estimator, or
+    produce infinities that propagate silently into the balance and effective
+    sample size summaries. `trim` bounds this, and ``n_trimmed`` reports how
+    many subjects were affected -- a nonzero count is a positivity warning
+    worth investigating rather than a routine detail.
     """
     if method not in ("iptw", "overlap", "matching"):
         raise ValueError('method must be "iptw", "overlap", or "matching"')
-
-    if treatment_var not in data.columns:
-        raise ValueError(f"'{treatment_var}' not found in data")
 
     if gps is None:
         gps = estimate_gps_multinom(
@@ -59,21 +78,42 @@ def compute_balancing_weights(
             anchor_level=anchor_level,
         )["gps"]
 
-    if len(gps) != len(data):
-        raise ValueError("gps and data must contain the same number of rows")
+    gps_values = validate_gps(
+        data, gps, treatment_var, "compute_balancing_weights"
+    )
+    treatment = treatment_labels(data, treatment_var)
 
-    treatment = data[treatment_var].astype(str).to_numpy()
-
-    missing_levels = [
-        level for level in np.unique(treatment) if level not in gps.columns
-    ]
+    # Hash rather than sort the treatment column; see the same check in
+    # `validate_gps`. Sorting only the missing levels keeps the message stable.
+    missing_levels = sorted(
+        level for level in pd.unique(treatment) if level not in gps.columns
+    )
     if missing_levels:
         raise ValueError(
             "Treatment group(s) not found in gps: " + ", ".join(missing_levels)
         )
 
-    gps_values = gps.to_numpy(dtype=float)
+    if (
+        isinstance(trim, bool)
+        or not isinstance(trim, (int, float, np.integer, np.floating))
+        or not np.isfinite(trim)
+        or trim < 0
+        or trim >= 1
+    ):
+        raise ValueError("trim must be in [0, 1)")
+
+    trim = float(trim)
+
     column_index = {column: i for i, column in enumerate(gps.columns)}
+
+    # Bound the scores away from zero before dividing by them. Left unbounded,
+    # a single near-zero score produces a weight large enough to dominate every
+    # downstream summary, or an infinity that propagates without a warning.
+    n_trimmed = int((gps_values < trim).any(axis=1).sum()) if trim > 0 else 0
+
+    if n_trimmed:
+        gps_values = np.clip(gps_values, trim, None)
+        gps_values = gps_values / gps_values.sum(axis=1, keepdims=True)
 
     own_gps = gps_values[
         np.arange(len(gps_values)),
@@ -102,6 +142,7 @@ def compute_balancing_weights(
         "h": h,
         "method": method,
         "gps": gps,
+        "n_trimmed": n_trimmed,
     }
 
 
@@ -142,35 +183,91 @@ def compute_weighted_balance(
 
     weights = np.asarray(weights, dtype=float)
 
+    if weights.ndim != 1:
+        raise ValueError("weights must be a one-dimensional array")
+
     if len(weights) != len(data):
         raise ValueError(
             "weights and data must contain the same number of observations"
         )
 
-    treatment = data[treatment_var].astype(str).to_numpy()
+    if not np.isfinite(weights).all():
+        raise ValueError("weights must all be finite")
+
+    if np.any(weights < 0):
+        raise ValueError("weights must be non-negative")
+
+    treatment = treatment_labels(data, treatment_var)
+    anchor_level = treatment_level(anchor_level)
     groups = [group for group in pd.unique(treatment) if group != anchor_level]
 
-    def weighted_mean(x, w):
-        return np.sum(x * w) / np.sum(w)
+    anchor_rows = require_rows(
+        np.flatnonzero(treatment == anchor_level),
+        anchor_level,
+        treatment_var,
+    )
+    group_rows = {
+        group: require_rows(
+            np.flatnonzero(treatment == group), group, treatment_var
+        )
+        for group in groups
+    }
 
-    def weighted_variance(x, w):
-        mean = weighted_mean(x, w)
-        return np.sum(w * (x - mean) ** 2) / np.sum(w)
+    X = covariate_matrix(data, X_vars)
+
+    if weights[anchor_rows].sum() <= 0:
+        raise ValueError("anchor-group weights must have a positive sum")
+
+    zero_weight_groups = [
+        group for group, rows in group_rows.items() if weights[rows].sum() <= 0
+    ]
+
+    if zero_weight_groups:
+        raise ValueError(
+            "Weights must have a positive sum in every treatment group; "
+            "zero total weight in: " + ", ".join(zero_weight_groups)
+        )
+
+    # The weight total and the mean are passed in rather than recomputed: the
+    # variance needs the mean its caller already has, and every covariate in an
+    # arm shares one weight total.
+    def weighted_mean(x, w, w_sum):
+        return np.sum(x * w) / w_sum
+
+    def weighted_variance(x, w, w_sum, mean):
+        return np.sum(w * (x - mean) ** 2) / w_sum
 
     rows = []
     anchor_mask = treatment == anchor_level
 
+    # Each arm's covariates and weights are gathered once, outside the covariate
+    # loop. Re-running the boolean gather per covariate copied 20,000 elements
+    # eight times over for each of the covariates, which at that size cost far
+    # more than the arithmetic it fed.
+    x_anchor_all = X[anchor_mask]
+    w_anchor = weights[anchor_mask]
+    w_anchor_sum = np.sum(w_anchor)
+
     for group in groups:
         group_mask = treatment == group
 
-        for covariate in X_vars:
-            x = data[covariate].to_numpy(dtype=float)
+        x_group_all = X[group_mask]
+        w_group = weights[group_mask]
+        w_group_sum = np.sum(w_group)
 
-            mean_anchor = weighted_mean(x[anchor_mask], weights[anchor_mask])
-            mean_group = weighted_mean(x[group_mask], weights[group_mask])
+        for position, covariate in enumerate(X_vars):
+            x_anchor = x_anchor_all[:, position]
+            x_group = x_group_all[:, position]
 
-            var_anchor = weighted_variance(x[anchor_mask], weights[anchor_mask])
-            var_group = weighted_variance(x[group_mask], weights[group_mask])
+            mean_anchor = weighted_mean(x_anchor, w_anchor, w_anchor_sum)
+            mean_group = weighted_mean(x_group, w_group, w_group_sum)
+
+            var_anchor = weighted_variance(
+                x_anchor, w_anchor, w_anchor_sum, mean_anchor
+            )
+            var_group = weighted_variance(
+                x_group, w_group, w_group_sum, mean_group
+            )
 
             pooled_sd = np.sqrt((var_anchor + var_group) / 2)
             smd = (mean_anchor - mean_group) / pooled_sd if pooled_sd > 0 else 0.0
@@ -180,6 +277,7 @@ def compute_weighted_balance(
                     "group": group,
                     "covariate": covariate,
                     "smd": smd,
+                    "smd_defined": bool(pooled_sd > 0),
                 }
             )
 
@@ -187,15 +285,18 @@ def compute_weighted_balance(
     summary_rows = []
 
     for group in groups:
-        values = by_covariate.loc[
-            by_covariate["group"] == group, "smd"
-        ].abs()
+        # Not `group_rows`: that name already holds this function's row indices
+        # per treatment group, and shadowing it here would be a trap for the
+        # next change to this loop.
+        group_smd = by_covariate.loc[by_covariate["group"] == group]
+        values = group_smd.loc[group_smd["smd_defined"], "smd"].abs()
 
         summary_rows.append(
             {
                 "group": group,
                 "mean_abs_smd": values.mean(),
                 "max_abs_smd": values.max(),
+                "n_undefined": int((~group_smd["smd_defined"]).sum()),
             }
         )
 
@@ -263,6 +364,7 @@ def evaluate_comparator_weighting(
     treatment_var="T",
     anchor_level="A",
     stabilize=True,
+    trim=1e-3,
 ):
     """
     Evaluate a multi-arm propensity score weighting method.
@@ -286,12 +388,15 @@ def evaluate_comparator_weighting(
         Anchor treatment group.
     stabilize : bool, default=True
         Whether to stabilize IPTW.
+    trim : float, default=1e-3
+        Lower bound applied to the generalized propensity scores. Passed
+        through to `compute_balancing_weights()`.
 
     Returns
     -------
     dict
         Dictionary containing weights, GPS values, weighted balance,
-        and effective sample size.
+        effective sample size, and ``n_trimmed``.
     """
     result = compute_balancing_weights(
         data,
@@ -301,6 +406,7 @@ def evaluate_comparator_weighting(
         treatment_var=treatment_var,
         anchor_level=anchor_level,
         stabilize=stabilize,
+        trim=trim,
     )
 
     balance = compute_weighted_balance(
@@ -322,4 +428,5 @@ def evaluate_comparator_weighting(
         "gps": result["gps"],
         "balance": balance,
         "ess": ess,
+        "n_trimmed": result["n_trimmed"],
     }

@@ -6,9 +6,27 @@ using a two-dimensional propensity score space, KD-tree candidate search,
 a perimeter-based caliper, and global greedy selection.
 """
 
+import heapq
+import math
+import warnings
+
 import numpy as np
 import pandas as pd
-from scipy.special import logit as _qlogis
+
+from ._match_common import (
+    build_matched_frame,
+    max_possible_rate,
+    summarize_matching,
+    transform_ps,
+)
+from ._validate import (
+    check_data_fingerprint,
+    check_gps_fingerprint,
+    require_positive_int,
+    treatment_labels,
+    treatment_level,
+    validate_gps,
+)
 
 
 def calc_caliper_3way(ps_used, treatment_var_values):
@@ -41,6 +59,26 @@ def calc_caliper_3way(ps_used, treatment_var_values):
 
     groups = np.unique(treatment_var_values)
 
+    if len(groups) != 3:
+        raise ValueError(
+            "`treatment_var_values` must contain exactly three treatment groups."
+        )
+
+    if not np.isfinite(ps_used).all():
+        raise ValueError("`ps_used` must contain only finite values.")
+
+    too_small = [
+        str(group)
+        for group in groups
+        if np.sum(treatment_var_values == group) < 2
+    ]
+
+    if too_small:
+        raise ValueError(
+            "The automatic three-way caliper requires at least two subjects "
+            "in every treatment group; too few in: " + ", ".join(too_small)
+        )
+
     var_by_group = np.array(
         [
             [
@@ -55,6 +93,13 @@ def calc_caliper_3way(ps_used, treatment_var_values):
 
 
 # KD-tree utilities -------------------------------------------------------------
+
+
+def _distance_sq_2d(point_1, point_2):
+    """Return a squared 2D distance without allocating temporary arrays."""
+    delta_0 = point_1[0] - point_2[0]
+    delta_1 = point_1[1] - point_2[1]
+    return float(delta_0 * delta_0 + delta_1 * delta_1)
 
 
 def kdtree_build(coords, idx=None, depth=0):
@@ -73,39 +118,124 @@ def kdtree_build(coords, idx=None, depth=0):
     Returns
     -------
     dict
-        KD-tree node.
+        KD-tree node. Each node carries ``n_active``, the number of points in
+        its subtree that are still available; see `kdtree_deactivate()`.
     """
     coords = np.asarray(coords, dtype=float)
+
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError("`coords` must have exactly two columns.")
 
     if idx is None:
         idx = np.arange(coords.shape[0])
 
+    if len(idx) == 0:
+        raise ValueError("a KD-tree needs at least one point.")
+
+    # Coercion and validation happen once here instead of at each of the ~2n
+    # recursive calls, and the split keys are read from plain lists. On subsets
+    # this small the per-node `np.asarray`, fancy index and `argsort` were
+    # almost entirely dispatch overhead.
+    columns = (coords[:, 0].tolist(), coords[:, 1].tolist())
+
+    return _kdtree_build_node(columns, np.asarray(idx).tolist(), depth)
+
+
+def _kdtree_build_node(columns, idx, depth):
+    """Recursive half of `kdtree_build()`, over pre-validated lists."""
     n = len(idx)
 
     if n == 1:
         return {
             "leaf": True,
-            "point": int(idx[0]),
+            "point": idx[0],
+            "n_active": 1,
         }
 
     dim = depth % 2
+    key = columns[dim]
 
-    # Stable sorting preserves deterministic tie handling.
-    order = np.argsort(coords[idx, dim], kind="stable")
-    ordered_idx = idx[order]
+    # `sorted` is stable, as `argsort(kind="stable")` was, and `idx` arrives in
+    # the parent's order in both versions -- so tied coordinates keep the same
+    # relative order and the tree is identical.
+    ordered_idx = sorted(idx, key=key.__getitem__)
 
     mid = n // 2
     left_idx = ordered_idx[:mid]
     right_idx = ordered_idx[mid:]
-    split_val = float(coords[right_idx[0], dim])
 
     return {
         "leaf": False,
         "split_dim": dim,
-        "split_val": split_val,
-        "left": kdtree_build(coords, left_idx, depth + 1),
-        "right": kdtree_build(coords, right_idx, depth + 1),
+        "split_val": key[right_idx[0]],
+        "n_active": n,
+        "left": _kdtree_build_node(columns, left_idx, depth + 1),
+        "right": _kdtree_build_node(columns, right_idx, depth + 1),
     }
+
+
+def kdtree_index(node, n_points):
+    """
+    Link each point to its leaf so that consumption can be propagated upward.
+
+    Parameters
+    ----------
+    node : dict
+        Root of a tree from `kdtree_build()`.
+    n_points : int
+        Number of points the tree was built over.
+
+    Returns
+    -------
+    list
+        ``leaf_of[point]`` is the leaf node holding that point.
+
+    Notes
+    -----
+    Descending to a point by comparing against ``split_val`` is not reliable:
+    the build splits a stable ordering at its midpoint, so a point whose
+    coordinate equals the split value may sit on either side. Recording the
+    leaves once, together with a parent link, gives an unambiguous path.
+    """
+    leaf_of = [None] * n_points
+    stack = [(node, None)]
+
+    while stack:
+        current, parent = stack.pop()
+        current["parent"] = parent
+
+        if current["leaf"]:
+            leaf_of[current["point"]] = current
+        else:
+            stack.append((current["left"], current))
+            stack.append((current["right"], current))
+
+    return leaf_of
+
+
+def kdtree_deactivate(leaf):
+    """
+    Mark one point as consumed, so its exhausted ancestors can be skipped.
+
+    Parameters
+    ----------
+    leaf : dict
+        Leaf node for the consumed point, from `kdtree_index()`.
+
+    Notes
+    -----
+    Must be called exactly once per point, paired with setting that point's
+    entry in the caller's ``active`` array to False. `kdtree_nearest()` and
+    `kdtree_range()` still consult ``active`` at the leaves, so a caller that
+    skips this only forfeits the pruning -- results are unaffected either way.
+    Without it, a query late in the matching loop walks a tree that is mostly
+    consumed, which is what made three-way matching grow superlinearly.
+    """
+    node = leaf
+
+    while node is not None:
+        node["n_active"] -= 1
+        node = node["parent"]
 
 
 def kdtree_nearest(node, coords, query, active):
@@ -128,6 +258,13 @@ def kdtree_nearest(node, coords, query, active):
     int or None
         Index of the nearest active point, or None if none is available.
     """
+    # A subtree with nothing left in it cannot hold the answer. This is only
+    # informative for callers that report consumption via kdtree_deactivate();
+    # for the rest the count stays at its initial value and the walk proceeds
+    # exactly as before.
+    if node["n_active"] == 0:
+        return None
+
     if node["leaf"]:
         point = node["point"]
         return point if active[point] else None
@@ -147,14 +284,14 @@ def kdtree_nearest(node, coords, query, active):
     if best is None:
         best_distance_sq = float("inf")
     else:
-        best_distance_sq = float(np.sum((coords[best] - query) ** 2))
+        best_distance_sq = _distance_sq_2d(coords[best], query)
 
     if gap * gap < best_distance_sq:
         candidate = kdtree_nearest(other, coords, query, active)
 
         if candidate is not None:
-            candidate_distance_sq = float(
-                np.sum((coords[candidate] - query) ** 2)
+            candidate_distance_sq = _distance_sq_2d(
+                coords[candidate], query
             )
 
             if candidate_distance_sq < best_distance_sq:
@@ -184,17 +321,46 @@ def kdtree_range(node, coords, query, radius2, active):
     -------
     list of int
         Indices of active points within the search radius.
+
+    Notes
+    -----
+    A subtree with nothing available in it is skipped. That only removes points
+    which could not have been returned, so the result -- and its order -- is
+    the same as an exhaustive scan.
+
+    Pruning on a per-node bounding box was tried as well and removed: it cut
+    only 8% of visited nodes, because the subtree the query descends into always
+    contains the query and so is never outside the radius, while the test cost
+    applies to every node visited. Reducing the node count further needs a
+    C-level tree, not a tighter bound here.
     """
+    # Points are appended to one accumulator rather than each level returning a
+    # fresh list for its parent to concatenate. Descent order is unchanged --
+    # primary subtree, then the other -- so the order points arrive in, which
+    # the perimeter greedy tie-breaks on, is exactly as before.
+    found = []
+    _kdtree_range_into(node, coords, query, radius2, active, found)
+    return found
+
+
+def _kdtree_range_into(node, coords, query, radius2, active, found):
+    """Append the active in-radius points of one subtree to `found`."""
+    if node["n_active"] == 0:
+        return
+
     if node["leaf"]:
         point = node["point"]
 
         if not active[point]:
-            return []
+            return
 
-        distance_sq = float(np.sum((coords[point] - query) ** 2))
+        distance_sq = _distance_sq_2d(coords[point], query)
 
         # Boundary points are excluded by design.
-        return [point] if distance_sq < radius2 else []
+        if distance_sq < radius2:
+            found.append(point)
+
+        return
 
     dim = node["split_dim"]
     gap = query[dim] - node["split_val"]
@@ -206,12 +372,10 @@ def kdtree_range(node, coords, query, radius2, active):
         primary = node["right"]
         other = node["left"]
 
-    result = kdtree_range(primary, coords, query, radius2, active)
+    _kdtree_range_into(primary, coords, query, radius2, active, found)
 
     if gap * gap < radius2:
-        result += kdtree_range(other, coords, query, radius2, active)
-
-    return result
+        _kdtree_range_into(other, coords, query, radius2, active, found)
 
 
 # Three-way matching -----------------------------------------------------------
@@ -224,9 +388,10 @@ def match_3way(
     X_vars=None,
     treatment_var="T",
     caliper="auto",
-    ps_space="raw",
+    gps_space="raw",
     top_n=10,
     reference_level=None,
+    ps_space=None,
 ):
     """
     Perform three-way nearest-neighbor propensity score matching.
@@ -247,20 +412,24 @@ def match_3way(
     gps : pandas.DataFrame
         Generalized propensity score matrix.
     X_vars : list of str, optional
-        Included for interface compatibility with `sam_match()`. Not used
-        by the three-way propensity score matching algorithm.
+        Included for interface compatibility with `sam_match()`. Not used by
+        the three-way propensity score matching algorithm; passing it emits a
+        `UserWarning`.
     treatment_var : str, default="T"
         Name of the treatment variable.
     caliper : {"auto"} or float, default="auto"
         Perimeter-scale caliper. ``"auto"`` uses `calc_caliper_3way()`.
-    ps_space : {"raw", "logit"}, default="raw"
-        Propensity score scale used for matching.
+    gps_space : {"raw", "logit"}, default="raw"
+        Propensity score scale used for matching. Named to match
+        `gps_candidate_search()`.
     top_n : int, default=10
         Maximum number of candidate trios retained per search-base subject
         during each candidate-generation step.
     reference_level : str, optional
         Treatment group whose GPS column is omitted when constructing the
         two-dimensional propensity score space. Defaults to the last group.
+    ps_space : {"raw", "logit"}, optional
+        Deprecated alias for `gps_space`.
 
     Returns
     -------
@@ -270,21 +439,43 @@ def match_3way(
         - ``matched``: matched trios and distance information.
         - ``unmatched_anchor_rows``: unmatched anchor row indices.
         - ``matching_rate``: proportion of anchor subjects matched.
+        - ``max_possible_rate``: the highest rate the group sizes allow.
         - ``caliper``: caliper used for matching.
         - ``red_level``: smallest treatment group used as the search base.
         - ``reference_level``: treatment group omitted from PS coordinates.
     """
-    # X_vars is retained for interface compatibility with sam_match().
-    _ = X_vars
+    # X_vars is retained for interface compatibility with sam_match(). This
+    # algorithm matches in propensity score space only, so passing covariates
+    # here has no effect and is worth saying out loud.
+    if X_vars is not None:
+        warnings.warn(
+            "match_3way() ignores X_vars: three-way matching operates in "
+            "propensity score space only. Covariates influence the result "
+            "through estimate_gps_multinom() instead.",
+            UserWarning,
+            stacklevel=2,
+        )
 
-    if ps_space not in ("raw", "logit"):
-        raise ValueError('ps_space must be "raw" or "logit"')
+    if ps_space is not None:
+        warnings.warn(
+            "`ps_space` is deprecated; use `gps_space` instead, which is the "
+            "name gps_candidate_search() already uses for the same option.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        gps_space = ps_space
+
+    if gps_space not in ("raw", "logit"):
+        raise ValueError('gps_space must be "raw" or "logit"')
 
     if treatment_var not in data.columns:
         raise ValueError(f"'{treatment_var}' not found in data")
 
-    if len(gps) != len(data):
-        raise ValueError("gps and data must contain the same number of rows")
+    check_data_fingerprint(search, data, treatment_var, "match_3way")
+    validate_gps(data, gps, treatment_var, "match_3way")
+    check_gps_fingerprint(search, gps, "match_3way")
+
+    top_n = require_positive_int(top_n, "top_n")
 
     groups = list(search["groups"])
 
@@ -295,7 +486,7 @@ def match_3way(
         )
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
-    treatment = data[treatment_var].astype(str).to_numpy()
+    treatment = treatment_labels(data, treatment_var)
 
     anchor_levels = np.unique(treatment[anchor_rows])
 
@@ -320,6 +511,8 @@ def match_3way(
 
     if reference_level is None:
         reference_level = all_levels[-1]
+    else:
+        reference_level = treatment_level(reference_level)
 
     if reference_level not in all_levels:
         raise ValueError(
@@ -330,13 +523,7 @@ def match_3way(
         level for level in all_levels if level != reference_level
     ]
 
-    ps_raw = gps[ps_levels].to_numpy(dtype=float)
-
-    if ps_space == "logit":
-        eps = 1e-6
-        ps_used = _qlogis(np.clip(ps_raw, eps, 1 - eps))
-    else:
-        ps_used = ps_raw
+    ps_used = transform_ps(gps[ps_levels].to_numpy(dtype=float), gps_space)
 
     if isinstance(caliper, str):
         if caliper != "auto":
@@ -348,11 +535,8 @@ def match_3way(
 
     caliper = float(caliper)
 
-    if caliper <= 0:
-        raise ValueError("`caliper` must be greater than zero.")
-
-    if top_n <= 0:
-        raise ValueError("`top_n` must be greater than zero.")
+    if not np.isfinite(caliper) or caliper <= 0:
+        raise ValueError("`caliper` must be finite and greater than zero.")
 
     # Use the smallest treatment group as the search base.
     rows_by_level = {
@@ -383,31 +567,85 @@ def match_3way(
     coords_o1 = ps_used[rows_by_level[o1]]
     coords_o2 = ps_used[rows_by_level[o2]]
 
-    tree_o1 = kdtree_build(coords_o1)
-    tree_o2 = kdtree_build(coords_o2)
+    # The tree walks read these one point and one flag at a time, hundreds of
+    # thousands of times, and a numpy row view or a `np.bool_` costs several
+    # times what a plain list lookup does. `tolist()` yields the identical
+    # doubles -- both are IEEE binary64 -- so `_distance_sq_2d()` evaluates the
+    # same two products and the same sum, and every branch it feeds is
+    # unchanged. The numpy arrays are kept for the vectorised perimeter block.
+    coords_red_list = coords_red.tolist()
+    coords_o1_list = coords_o1.tolist()
+    coords_o2_list = coords_o2.tolist()
 
-    active_o1 = np.ones(len(coords_o1), dtype=bool)
-    active_o2 = np.ones(len(coords_o2), dtype=bool)
+    active_o1 = [True] * len(coords_o1)
+    active_o2 = [True] * len(coords_o2)
+
+    # A KD-tree built once over every subject keeps describing subjects that
+    # have since been matched away: its bounding boxes stay wide and its
+    # subtrees stay walkable while holding almost nothing available, so late
+    # queries walk the whole consumed neighbourhood to find a few survivors.
+    # Rebuilding over the survivors whenever half of them are gone keeps every
+    # query proportional to what is actually left, at an amortised cost of
+    # O(n log n) per halving.
+    #
+    # `kdtree_build()` takes the surviving positions directly and keeps
+    # reporting original ones, so a rebuild is transparent to everything else.
+    trees = {}
+
+    def rebuild(side, coords, active):
+        """Index the surviving subjects of one comparator group."""
+        survivors = np.flatnonzero(np.asarray(active, dtype=bool))
+
+        if len(survivors) == 0:
+            trees[side] = (None, None, 0)
+            return
+
+        root = kdtree_build(coords, survivors)
+
+        trees[side] = (
+            root,
+            kdtree_index(root, len(coords)),
+            len(survivors),
+        )
+
+    def consume(side, coords, active, point):
+        """Retire one subject, rebuilding the index once half of them are gone."""
+        root, leaf_of, at_last_rebuild = trees[side]
+
+        active[point] = False
+        kdtree_deactivate(leaf_of[point])
+
+        if root["n_active"] * 2 <= at_last_rebuild:
+            rebuild(side, coords, active)
+
+    rebuild("o1", coords_o1, active_o1)
+    rebuild("o2", coords_o2, active_o2)
 
     matched_flag = np.zeros(n_red, dtype=bool)
     exhausted = np.zeros(n_red, dtype=bool)
     counters = np.zeros(n_red, dtype=int)
 
-    pool_red = []
-    pool_o1 = []
-    pool_o2 = []
-    pool_perimeter = []
-    pool_dist_o1 = []
-    pool_dist_o2 = []
+    candidate_heap = []
+    next_candidate_order = 0
 
     def push_candidates(i):
         """Generate candidate trios for one search-base subject."""
+        nonlocal next_candidate_order
         point_red = coords_red[i]
+        point_red_list = coords_red_list[i]
+
+        tree_o1 = trees["o1"][0]
+        tree_o2 = trees["o2"][0]
+
+        if tree_o1 is None or tree_o2 is None:
+            exhausted[i] = True
+            counters[i] = 0
+            return
 
         nearest_o1 = kdtree_nearest(
             tree_o1,
-            coords_o1,
-            point_red,
+            coords_o1_list,
+            point_red_list,
             active_o1,
         )
 
@@ -418,8 +656,8 @@ def match_3way(
 
         nearest_o2 = kdtree_nearest(
             tree_o2,
-            coords_o2,
-            coords_o1[nearest_o1],
+            coords_o2_list,
+            coords_o1_list[nearest_o1],
             active_o2,
         )
 
@@ -428,47 +666,36 @@ def match_3way(
             counters[i] = 0
             return
 
-        dist_red_o1 = float(
-            np.sqrt(
-                np.sum((point_red - coords_o1[nearest_o1]) ** 2)
-            )
-        )
-        dist_red_o2 = float(
-            np.sqrt(
-                np.sum((point_red - coords_o2[nearest_o2]) ** 2)
-            )
-        )
-        dist_o1_o2 = float(
-            np.sqrt(
-                np.sum(
-                    (coords_o1[nearest_o1] - coords_o2[nearest_o2]) ** 2
-                )
-            )
-        )
+        # `np.sum((a - b) ** 2)` over two elements is the same two squares and
+        # the same single addition that `_distance_sq_2d()` performs, and
+        # `math.sqrt` and `np.sqrt` are both the correctly-rounded IEEE root, so
+        # these three seed distances are bit-for-bit what they were.
+        point_o1 = coords_o1_list[nearest_o1]
+        point_o2 = coords_o2_list[nearest_o2]
+
+        dist_red_o1 = math.sqrt(_distance_sq_2d(point_red_list, point_o1))
+        dist_red_o2 = math.sqrt(_distance_sq_2d(point_red_list, point_o2))
+        dist_o1_o2 = math.sqrt(_distance_sq_2d(point_o1, point_o2))
 
         seed_perimeter = dist_red_o1 + dist_red_o2 + dist_o1_o2
 
         candidate_o1 = []
         candidate_o2 = []
         candidate_perimeter = []
-        candidate_dist_o1 = []
-        candidate_dist_o2 = []
 
         # Always consider the nearest-neighbor seed trio.
         if seed_perimeter <= caliper:
             candidate_o1.append(nearest_o1)
             candidate_o2.append(nearest_o2)
             candidate_perimeter.append(seed_perimeter)
-            candidate_dist_o1.append(dist_red_o1)
-            candidate_dist_o2.append(dist_red_o2)
 
         radius_sq = (seed_perimeter / 2) ** 2
 
         neighbors_o1 = np.asarray(
             kdtree_range(
                 tree_o1,
-                coords_o1,
-                point_red,
+                coords_o1_list,
+                point_red_list,
                 radius_sq,
                 active_o1,
             ),
@@ -477,8 +704,8 @@ def match_3way(
         neighbors_o2 = np.asarray(
             kdtree_range(
                 tree_o2,
-                coords_o2,
-                point_red,
+                coords_o2_list,
+                point_red_list,
                 radius_sq,
                 active_o2,
             ),
@@ -528,12 +755,6 @@ def match_3way(
                 candidate_perimeter.extend(
                     perimeter[o1_idx, o2_idx].tolist()
                 )
-                candidate_dist_o1.extend(
-                    dist_red_to_o1[o1_idx].tolist()
-                )
-                candidate_dist_o2.extend(
-                    dist_red_to_o2[o2_idx].tolist()
-                )
 
         if len(candidate_perimeter) == 0:
             exhausted[i] = True
@@ -549,12 +770,20 @@ def match_3way(
         )[: min(top_n, len(candidate_perimeter))]
 
         for candidate_idx in order:
-            pool_red.append(i)
-            pool_o1.append(candidate_o1[candidate_idx])
-            pool_o2.append(candidate_o2[candidate_idx])
-            pool_perimeter.append(candidate_perimeter[candidate_idx])
-            pool_dist_o1.append(candidate_dist_o1[candidate_idx])
-            pool_dist_o2.append(candidate_dist_o2[candidate_idx])
+            # The monotonic insertion order is the second heap key. It
+            # preserves min(list, key=...)'s first-occurrence tie handling
+            # without scanning and deleting from parallel Python lists.
+            heapq.heappush(
+                candidate_heap,
+                (
+                    float(candidate_perimeter[candidate_idx]),
+                    next_candidate_order,
+                    i,
+                    candidate_o1[candidate_idx],
+                    candidate_o2[candidate_idx],
+                ),
+            )
+            next_candidate_order += 1
 
         counters[i] = len(order)
 
@@ -564,32 +793,23 @@ def match_3way(
     matched_rows = []
 
     # Global greedy selection without replacement.
-    while pool_perimeter:
-        # min() selects the first occurrence when perimeters are tied.
-        pop_idx = min(
-            range(len(pool_perimeter)),
-            key=lambda index: pool_perimeter[index],
-        )
-
-        red_idx_local = pool_red[pop_idx]
-        o1_idx_local = pool_o1[pop_idx]
-        o2_idx_local = pool_o2[pop_idx]
-        perimeter_selected = pool_perimeter[pop_idx]
-
-        del pool_red[pop_idx]
-        del pool_o1[pop_idx]
-        del pool_o2[pop_idx]
-        del pool_perimeter[pop_idx]
-        del pool_dist_o1[pop_idx]
-        del pool_dist_o2[pop_idx]
+    while candidate_heap:
+        (
+            perimeter_selected,
+            _,
+            red_idx_local,
+            o1_idx_local,
+            o2_idx_local,
+        ) = heapq.heappop(candidate_heap)
 
         if matched_flag[red_idx_local]:
             continue
 
         if active_o1[o1_idx_local] and active_o2[o2_idx_local]:
             matched_flag[red_idx_local] = True
-            active_o1[o1_idx_local] = False
-            active_o2[o2_idx_local] = False
+
+            consume("o1", coords_o1, active_o1, o1_idx_local)
+            consume("o2", coords_o2, active_o2, o2_idx_local)
 
             row_red = int(
                 rows_by_level[red_level][red_idx_local]
@@ -645,42 +865,20 @@ def match_3way(
             if counters[red_idx_local] <= 0 and not exhausted[red_idx_local]:
                 push_candidates(red_idx_local)
 
-    if matched_rows:
-        matched = pd.DataFrame(matched_rows)
-    else:
-        columns = [
-            "matched_set_id",
-            "anchor",
-            *groups,
-            *[f"dist_{group}" for group in groups],
-            "loss",
-            "rassen_perimeter",
-        ]
-        matched = pd.DataFrame(columns=columns)
-
-    if len(matched) > 0:
-        matched_anchor_rows = set(matched["anchor"].tolist())
-    else:
-        matched_anchor_rows = set()
-
-    unmatched_anchor_rows = np.asarray(
-        [
-            row
-            for row in anchor_rows
-            if row not in matched_anchor_rows
-        ],
-        dtype=int,
+    matched = build_matched_frame(
+        matched_rows, groups, extra_columns=("rassen_perimeter",)
     )
-
-    if len(anchor_rows) > 0:
-        matching_rate = len(matched) / len(anchor_rows)
-    else:
-        matching_rate = float("nan")
+    unmatched_anchor_rows, matching_rate = summarize_matching(
+        matched, anchor_rows
+    )
 
     return {
         "matched": matched,
         "unmatched_anchor_rows": unmatched_anchor_rows,
         "matching_rate": matching_rate,
+        "max_possible_rate": max_possible_rate(
+            {group: rows_by_level[group] for group in groups}, anchor_rows
+        ),
         "caliper": caliper,
         "red_level": red_level,
         "reference_level": reference_level,

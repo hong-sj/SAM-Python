@@ -6,8 +6,15 @@ import warnings
 
 import numpy as np
 
+from ._validate import (
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+)
 
-def get_pooled_covariance(data, X_vars, treatment_var):
+
+def get_pooled_covariance(data, X_vars=None, treatment_var="T"):
     """
     Compute the pooled within-group covariance matrix.
 
@@ -19,9 +26,9 @@ def get_pooled_covariance(data, X_vars, treatment_var):
     ----------
     data : pandas.DataFrame
         Data containing the covariates and treatment variable.
-    X_vars : list of str
-        Covariate column names.
-    treatment_var : str
+    X_vars : list of str, optional
+        Covariate column names. Defaults to X1 through X10.
+    treatment_var : str, default="T"
         Name of the treatment variable.
 
     Returns
@@ -32,16 +39,28 @@ def get_pooled_covariance(data, X_vars, treatment_var):
         - ``S``: pooled within-group covariance matrix.
         - ``S_inv``: inverse covariance matrix.
     """
-    groups = data[treatment_var].unique()
+    if X_vars is None:
+        X_vars = [f"X{i}" for i in range(1, 11)]
+
+    X = covariate_matrix(data, X_vars)
+    treatment = treatment_labels(data, treatment_var)
+
+    groups = np.unique(treatment)
     p = len(X_vars)
+
+    df = len(data) - len(groups)
+
+    if df <= 0:
+        raise ValueError(
+            "insufficient residual degrees of freedom to estimate the pooled "
+            f"covariance matrix: {len(data)} rows across {len(groups)} "
+            "treatment groups. Each group needs more than one subject."
+        )
 
     S_within = np.zeros((p, p))
 
     for group in groups:
-        X_group = data.loc[
-            data[treatment_var] == group,
-            X_vars,
-        ].to_numpy(dtype=float)
+        X_group = X[treatment == group]
 
         X_centered = X_group - X_group.mean(
             axis=0,
@@ -50,12 +69,18 @@ def get_pooled_covariance(data, X_vars, treatment_var):
 
         S_within += X_centered.T @ X_centered
 
-    df = len(data) - len(groups)
     S = S_within / df
 
+    # numpy.linalg.inv does not raise on every degenerate input -- notably it
+    # returns an all-NaN matrix rather than raising -- so the result is
+    # checked explicitly instead of relying solely on the exception.
     try:
         S_inv = np.linalg.inv(S)
+        degenerate = not np.isfinite(S_inv).all()
     except np.linalg.LinAlgError:
+        degenerate = True
+
+    if degenerate:
         warnings.warn(
             "Pooled covariance matrix is numerically singular; "
             "falling back to numpy.linalg.pinv().",
@@ -164,27 +189,32 @@ def build_group_distance_matrices(
         treatment_var,
     )
 
-    treatment = data[treatment_var].to_numpy()
+    treatment = treatment_labels(data, treatment_var)
 
+    # Comparison goes through treatment_level() for the same reason every other
+    # call site does: treatment labels are canonicalised to strings, so a raw
+    # numeric group label would match no rows and report a level as absent that
+    # is in fact present.
     group_rows = {
-        group: np.flatnonzero(treatment == group)
+        group: require_rows(
+            np.flatnonzero(treatment == treatment_level(group)),
+            group,
+            treatment_var,
+        )
         for group in groups
     }
 
-    X_anchor = data.iloc[anchor_rows][
-        X_vars
-    ].to_numpy(dtype=float)
+    # Materialise the covariates once and slice with numpy rather than
+    # rebuilding an intermediate DataFrame per group.
+    X = covariate_matrix(data, X_vars)
+    X_anchor = X[np.asarray(anchor_rows, dtype=int)]
 
     distance_matrices = {}
 
     for group in groups:
-        X_group = data.iloc[group_rows[group]][
-            X_vars
-        ].to_numpy(dtype=float)
-
         distance_matrices[group] = mahalanobis_distance_matrix(
             X_anchor,
-            X_group,
+            X[group_rows[group]],
             pooled["S_inv"],
         )
 

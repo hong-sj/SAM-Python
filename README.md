@@ -1,6 +1,7 @@
 # SAM-Python
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21926925.svg)](https://doi.org/10.5281/zenodo.21926925)
+[![CI](https://github.com/hong-sj/SAM-Python/actions/workflows/ci.yml/badge.svg)](https://github.com/hong-sj/SAM-Python/actions/workflows/ci.yml)
 
 ## Shared Anchor Matching: A Scalable Matching Framework for Multiple Treatment Groups
 
@@ -106,10 +107,13 @@ matched = samatch.sam_match(
 )
 
 print(matched["matching_rate"])
+print(matched["max_possible_rate"])
 print(matched["matched"].head())
 ```
 
 The resulting object contains the matched sets, group-specific Mahalanobis distances, total matching loss, unmatched anchor subjects, and overall matching rate.
+
+Every matched set consumes one subject from each comparator group, so the matching rate is bounded above by the size of the smallest comparator group divided by the number of anchor subjects. On the bundled four-group dataset that ceiling is 59/448 = 0.132, which is also the rate SAM achieves — every possible set was formed. Read `matching_rate` against `max_possible_rate` rather than against 1.0.
 
 ### 4. Evaluate matching quality
 
@@ -205,10 +209,9 @@ matched3 = samatch.match_3way(
     data3,
     search3,
     fit3["gps"],
-    X_vars=covariates3,
     treatment_var="treatment",
     caliper="auto",
-    ps_space="raw",
+    gps_space="raw",
     top_n=10,
 )
 
@@ -216,7 +219,7 @@ print(matched3["matching_rate"])
 print(matched3["matched"].head())
 ```
 
-`match_3way()` requires exactly three treatment groups.
+`match_3way()` requires exactly three treatment groups. It matches in propensity score space only, so it takes no `X_vars`; covariates enter through `estimate_gps_multinom()`.
 
 ---
 
@@ -245,7 +248,10 @@ weighting = samatch.evaluate_comparator_weighting(
 
 print(weighting["balance"]["summary"])
 print(weighting["ess"])
+print(weighting["n_trimmed"])
 ```
+
+Balancing weights divide by each subject's own propensity score, so a score near zero yields a weight large enough to dominate every summary that follows. Scores are therefore bounded below by `trim` (default `1e-3`, set `trim=0` to disable), and `n_trimmed` reports how many subjects were affected. A nonzero count is a positivity problem worth investigating rather than a routine detail.
 
 ---
 
@@ -264,6 +270,24 @@ print(weighting["ess"])
 | `compute_weighted_balance()` | Assess weighted covariate balance |
 | `compute_effective_sample_size()` | Calculate effective sample size after weighting |
 | `evaluate_comparator_weighting()` | Evaluate weighting, balance, and effective sample size |
+
+The individual diagnostics used by `sam_evaluate()` are also public, and can be called directly on a matched-set frame:
+
+| Function | Description |
+|---|---|
+| `compute_smd_balance()` | Standardized mean differences per covariate and comparator group |
+| `compute_pairwise_treatment_auc()` | Pairwise treatment-discrimination AUC |
+| `get_pooled_covariance()` | Pooled within-group covariance and precision matrix |
+| `mahalanobis_distance_matrix()` | Pairwise Mahalanobis distances |
+| `build_group_distance_matrices()` | Anchor-to-comparator distance matrix per group |
+
+---
+
+## Requirements on the Input Data
+
+- **Covariates must be numeric and complete.** `X_vars` columns are used directly in linear algebra, so categorical covariates need encoding (for example with `pandas.get_dummies`) and missing values need dropping or imputing first. SAM does not impute.
+- **Pass the same DataFrame and GPS through the whole pipeline.** Matched sets reference positional row indices, so `data` and `gps` must keep the same subjects in the same order that `gps_candidate_search()` saw. Original data values and GPS values are fingerprinted; changing, sorting, or re-indexing them raises rather than producing a report about the wrong subjects. Adding a new column to `data` between stages is fine.
+- **Treatment levels are compared as strings.** A numeric treatment column works, and `anchor_level` may be given either as `0` or as `"0"`.
 
 ---
 

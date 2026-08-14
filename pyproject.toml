@@ -3,8 +3,8 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sam-shared-anchor-matching"
-version = "0.1.0"
+name = "samatch"
+version = "0.1.1"
 description = "Shared Anchor Matching: a scalable matching framework for multiple treatment groups."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest interpreters pyproject.toml claims to support,
+        # plus one in between. The dependency floors resolve very differently
+        # across this range, so all three are worth running.
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Show resolved dependency versions
+        run: python -m pip list
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  golden-reference:
+    # The golden fixtures pin the output of two iterative solvers, so they can
+    # only be compared to full precision on the stack that produced them. This
+    # job reconstructs that stack, and is the one place the strict comparison
+    # actually runs -- everywhere else those tests skip.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the environment the fixtures were generated on
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          python - <<'PY' > constraints.txt
+          import json
+          for package, version in json.load(open("tests/golden/ENVIRONMENT.json")).items():
+              print(f"{package}=={version}")
+          PY
+          cat constraints.txt
+          python -m pip install -r constraints.txt
+
+      - name: Confirm the strict comparison is active
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "tests")
+          from _golden_environment import environment_summary, is_reference_environment
+          if not is_reference_environment():
+              sys.exit(f"not the reference environment: {environment_summary()}")
+          print("reference environment reconstructed; golden fixtures compare strictly")
+          PY
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  minimum-dependencies:
+    # The floors declared in pyproject.toml are only meaningful if something
+    # actually installs them.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install with the declared minimum versions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          python -m pip install \
+            "numpy==1.23.*" "pandas==1.5.*" "scipy==1.9.*" "scikit-learn==1.2.*"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
