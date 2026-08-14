@@ -7,6 +7,7 @@ a perimeter-based caliper, and global greedy selection.
 """
 
 import heapq
+import math
 import warnings
 
 import numpy as np
@@ -131,33 +132,45 @@ def kdtree_build(coords, idx=None, depth=0):
     if len(idx) == 0:
         raise ValueError("a KD-tree needs at least one point.")
 
+    # Coercion and validation happen once here instead of at each of the ~2n
+    # recursive calls, and the split keys are read from plain lists. On subsets
+    # this small the per-node `np.asarray`, fancy index and `argsort` were
+    # almost entirely dispatch overhead.
+    columns = (coords[:, 0].tolist(), coords[:, 1].tolist())
+
+    return _kdtree_build_node(columns, np.asarray(idx).tolist(), depth)
+
+
+def _kdtree_build_node(columns, idx, depth):
+    """Recursive half of `kdtree_build()`, over pre-validated lists."""
     n = len(idx)
 
     if n == 1:
         return {
             "leaf": True,
-            "point": int(idx[0]),
+            "point": idx[0],
             "n_active": 1,
         }
 
     dim = depth % 2
+    key = columns[dim]
 
-    # Stable sorting preserves deterministic tie handling.
-    order = np.argsort(coords[idx, dim], kind="stable")
-    ordered_idx = idx[order]
+    # `sorted` is stable, as `argsort(kind="stable")` was, and `idx` arrives in
+    # the parent's order in both versions -- so tied coordinates keep the same
+    # relative order and the tree is identical.
+    ordered_idx = sorted(idx, key=key.__getitem__)
 
     mid = n // 2
     left_idx = ordered_idx[:mid]
     right_idx = ordered_idx[mid:]
-    split_val = float(coords[right_idx[0], dim])
 
     return {
         "leaf": False,
         "split_dim": dim,
-        "split_val": split_val,
+        "split_val": key[right_idx[0]],
         "n_active": n,
-        "left": kdtree_build(coords, left_idx, depth + 1),
-        "right": kdtree_build(coords, right_idx, depth + 1),
+        "left": _kdtree_build_node(columns, left_idx, depth + 1),
+        "right": _kdtree_build_node(columns, right_idx, depth + 1),
     }
 
 
@@ -321,19 +334,33 @@ def kdtree_range(node, coords, query, radius2, active):
     applies to every node visited. Reducing the node count further needs a
     C-level tree, not a tighter bound here.
     """
+    # Points are appended to one accumulator rather than each level returning a
+    # fresh list for its parent to concatenate. Descent order is unchanged --
+    # primary subtree, then the other -- so the order points arrive in, which
+    # the perimeter greedy tie-breaks on, is exactly as before.
+    found = []
+    _kdtree_range_into(node, coords, query, radius2, active, found)
+    return found
+
+
+def _kdtree_range_into(node, coords, query, radius2, active, found):
+    """Append the active in-radius points of one subtree to `found`."""
     if node["n_active"] == 0:
-        return []
+        return
 
     if node["leaf"]:
         point = node["point"]
 
         if not active[point]:
-            return []
+            return
 
         distance_sq = _distance_sq_2d(coords[point], query)
 
         # Boundary points are excluded by design.
-        return [point] if distance_sq < radius2 else []
+        if distance_sq < radius2:
+            found.append(point)
+
+        return
 
     dim = node["split_dim"]
     gap = query[dim] - node["split_val"]
@@ -345,12 +372,10 @@ def kdtree_range(node, coords, query, radius2, active):
         primary = node["right"]
         other = node["left"]
 
-    result = kdtree_range(primary, coords, query, radius2, active)
+    _kdtree_range_into(primary, coords, query, radius2, active, found)
 
     if gap * gap < radius2:
-        result += kdtree_range(other, coords, query, radius2, active)
-
-    return result
+        _kdtree_range_into(other, coords, query, radius2, active, found)
 
 
 # Three-way matching -----------------------------------------------------------
@@ -542,8 +567,18 @@ def match_3way(
     coords_o1 = ps_used[rows_by_level[o1]]
     coords_o2 = ps_used[rows_by_level[o2]]
 
-    active_o1 = np.ones(len(coords_o1), dtype=bool)
-    active_o2 = np.ones(len(coords_o2), dtype=bool)
+    # The tree walks read these one point and one flag at a time, hundreds of
+    # thousands of times, and a numpy row view or a `np.bool_` costs several
+    # times what a plain list lookup does. `tolist()` yields the identical
+    # doubles -- both are IEEE binary64 -- so `_distance_sq_2d()` evaluates the
+    # same two products and the same sum, and every branch it feeds is
+    # unchanged. The numpy arrays are kept for the vectorised perimeter block.
+    coords_red_list = coords_red.tolist()
+    coords_o1_list = coords_o1.tolist()
+    coords_o2_list = coords_o2.tolist()
+
+    active_o1 = [True] * len(coords_o1)
+    active_o2 = [True] * len(coords_o2)
 
     # A KD-tree built once over every subject keeps describing subjects that
     # have since been matched away: its bounding boxes stay wide and its
@@ -559,7 +594,7 @@ def match_3way(
 
     def rebuild(side, coords, active):
         """Index the surviving subjects of one comparator group."""
-        survivors = np.flatnonzero(active)
+        survivors = np.flatnonzero(np.asarray(active, dtype=bool))
 
         if len(survivors) == 0:
             trees[side] = (None, None, 0)
@@ -597,6 +632,7 @@ def match_3way(
         """Generate candidate trios for one search-base subject."""
         nonlocal next_candidate_order
         point_red = coords_red[i]
+        point_red_list = coords_red_list[i]
 
         tree_o1 = trees["o1"][0]
         tree_o2 = trees["o2"][0]
@@ -608,8 +644,8 @@ def match_3way(
 
         nearest_o1 = kdtree_nearest(
             tree_o1,
-            coords_o1,
-            point_red,
+            coords_o1_list,
+            point_red_list,
             active_o1,
         )
 
@@ -620,8 +656,8 @@ def match_3way(
 
         nearest_o2 = kdtree_nearest(
             tree_o2,
-            coords_o2,
-            coords_o1[nearest_o1],
+            coords_o2_list,
+            coords_o1_list[nearest_o1],
             active_o2,
         )
 
@@ -630,23 +666,16 @@ def match_3way(
             counters[i] = 0
             return
 
-        dist_red_o1 = float(
-            np.sqrt(
-                np.sum((point_red - coords_o1[nearest_o1]) ** 2)
-            )
-        )
-        dist_red_o2 = float(
-            np.sqrt(
-                np.sum((point_red - coords_o2[nearest_o2]) ** 2)
-            )
-        )
-        dist_o1_o2 = float(
-            np.sqrt(
-                np.sum(
-                    (coords_o1[nearest_o1] - coords_o2[nearest_o2]) ** 2
-                )
-            )
-        )
+        # `np.sum((a - b) ** 2)` over two elements is the same two squares and
+        # the same single addition that `_distance_sq_2d()` performs, and
+        # `math.sqrt` and `np.sqrt` are both the correctly-rounded IEEE root, so
+        # these three seed distances are bit-for-bit what they were.
+        point_o1 = coords_o1_list[nearest_o1]
+        point_o2 = coords_o2_list[nearest_o2]
+
+        dist_red_o1 = math.sqrt(_distance_sq_2d(point_red_list, point_o1))
+        dist_red_o2 = math.sqrt(_distance_sq_2d(point_red_list, point_o2))
+        dist_o1_o2 = math.sqrt(_distance_sq_2d(point_o1, point_o2))
 
         seed_perimeter = dist_red_o1 + dist_red_o2 + dist_o1_o2
 
@@ -665,8 +694,8 @@ def match_3way(
         neighbors_o1 = np.asarray(
             kdtree_range(
                 tree_o1,
-                coords_o1,
-                point_red,
+                coords_o1_list,
+                point_red_list,
                 radius_sq,
                 active_o1,
             ),
@@ -675,8 +704,8 @@ def match_3way(
         neighbors_o2 = np.asarray(
             kdtree_range(
                 tree_o2,
-                coords_o2,
-                point_red,
+                coords_o2_list,
+                point_red_list,
                 radius_sq,
                 active_o2,
             ),
