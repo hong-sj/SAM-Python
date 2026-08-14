@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from ._mahalanobis import get_pooled_covariance, mahalanobis_distance_matrix
+from ._validate import require_rows, treatment_labels, treatment_level
 
 
 def sam_match(
@@ -49,9 +50,6 @@ def sam_match(
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
-    if treatment_var not in data.columns:
-        raise ValueError(f"'{treatment_var}' not found in data")
-
     missing_covariates = [
         covariate for covariate in X_vars if covariate not in data.columns
     ]
@@ -69,9 +67,13 @@ def sam_match(
     pooled = get_pooled_covariance(data, X_vars, treatment_var)
     s_inv = pooled["S_inv"]
 
-    treatment = data[treatment_var].to_numpy()
+    treatment = treatment_labels(data, treatment_var)
     group_rows = {
-        group: np.flatnonzero(treatment == group)
+        group: require_rows(
+            np.flatnonzero(treatment == treatment_level(group)),
+            group,
+            treatment_var,
+        )
         for group in groups
     }
 

@@ -6,6 +6,8 @@ import warnings
 
 import numpy as np
 
+from ._validate import require_rows, treatment_labels
+
 
 def get_pooled_covariance(data, X_vars, treatment_var):
     """
@@ -32,16 +34,15 @@ def get_pooled_covariance(data, X_vars, treatment_var):
         - ``S``: pooled within-group covariance matrix.
         - ``S_inv``: inverse covariance matrix.
     """
-    groups = data[treatment_var].unique()
+    treatment = treatment_labels(data, treatment_var)
+
+    groups = np.unique(treatment)
     p = len(X_vars)
 
     S_within = np.zeros((p, p))
 
     for group in groups:
-        X_group = data.loc[
-            data[treatment_var] == group,
-            X_vars,
-        ].to_numpy(dtype=float)
+        X_group = data.loc[treatment == group, X_vars].to_numpy(dtype=float)
 
         X_centered = X_group - X_group.mean(
             axis=0,
@@ -164,10 +165,14 @@ def build_group_distance_matrices(
         treatment_var,
     )
 
-    treatment = data[treatment_var].to_numpy()
+    treatment = treatment_labels(data, treatment_var)
 
     group_rows = {
-        group: np.flatnonzero(treatment == group)
+        group: require_rows(
+            np.flatnonzero(treatment == group),
+            group,
+            treatment_var,
+        )
         for group in groups
     }
 

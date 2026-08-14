@@ -9,7 +9,12 @@ score (GPS) space.
 import numpy as np
 from scipy.special import logit as _qlogis
 
-from ._validate import require_positive_int
+from ._validate import (
+    require_positive_int,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+)
 
 
 def gps_candidate_search(
@@ -57,13 +62,11 @@ def gps_candidate_search(
     if gps_space not in ("raw", "logit"):
         raise ValueError('gps_space must be "raw" or "logit"')
 
-    if treatment_var not in data.columns:
-        raise ValueError(f"'{treatment_var}' not found in data")
-
     if len(gps) != len(data):
         raise ValueError("gps and data must contain the same number of rows")
 
     top_m = require_positive_int(top_m, "top_m")
+    anchor_level = treatment_level(anchor_level)
 
     gps_values = gps.to_numpy(dtype=float)
 
@@ -74,17 +77,27 @@ def gps_candidate_search(
     else:
         gps_used = gps_values
 
-    groups = [group for group in gps.columns if group != anchor_level]
-    treatment = data[treatment_var].to_numpy()
+    groups = [
+        group for group in gps.columns if treatment_level(group) != anchor_level
+    ]
+    treatment = treatment_labels(data, treatment_var)
 
-    anchor_rows = np.flatnonzero(treatment == anchor_level)
+    anchor_rows = require_rows(
+        np.flatnonzero(treatment == anchor_level),
+        anchor_level,
+        treatment_var,
+    )
     x_anchor = gps_used[anchor_rows]
 
     # Compute Euclidean GPS distances for each comparator group.
     candidates_by_group = {}
 
     for group in groups:
-        group_rows = np.flatnonzero(treatment == group)
+        group_rows = require_rows(
+            np.flatnonzero(treatment == treatment_level(group)),
+            group,
+            treatment_var,
+        )
         x_group = gps_used[group_rows]
 
         x_sq = np.sum(x_anchor**2, axis=1)

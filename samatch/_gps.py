@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
+from ._validate import treatment_labels, treatment_level
+
 
 def _fit_unregularized_multinomial_logit(
     X,
@@ -100,9 +102,6 @@ def estimate_gps_multinom(
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
-    if treatment_var not in data.columns:
-        raise ValueError(f"'{treatment_var}' not found in data")
-
     missing_covariates = [
         covariate
         for covariate in X_vars
@@ -116,7 +115,8 @@ def estimate_gps_multinom(
         )
 
     X = data[X_vars].to_numpy(dtype=float)
-    y = data[treatment_var].astype(str).to_numpy()
+    y = treatment_labels(data, treatment_var)
+    anchor_level = treatment_level(anchor_level)
 
     treatment_levels = np.unique(y)
 
