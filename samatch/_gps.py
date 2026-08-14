@@ -25,6 +25,8 @@ def _fit_unregularized_multinomial_logit(
     X_scaled = (X - mean) / sd_safe
 
     # Request an unregularized model across supported scikit-learn versions.
+    regularized_fallback = False
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
 
@@ -40,16 +42,7 @@ def _fit_unregularized_multinomial_logit(
             if "penalty" not in str(error):
                 raise
 
-            # Very old scikit-learn cannot express "no penalty" this way. The
-            # fallback is regularized, which contradicts what this function
-            # promises, so it must not pass unnoticed.
-            warnings.warn(
-                "This scikit-learn version does not support penalty=None; "
-                "falling back to the default L2-regularized model. The "
-                "estimated GPS will be shrunk toward zero. Upgrade "
-                "scikit-learn to obtain unregularized estimates.",
-                RuntimeWarning,
-            )
+            regularized_fallback = True
 
             model = LogisticRegression(
                 solver="lbfgs",
@@ -63,6 +56,17 @@ def _fit_unregularized_multinomial_logit(
             for warning in caught
             if "Convergence" in warning.category.__name__
         ]
+
+    if regularized_fallback:
+        # Emit this after leaving catch_warnings(record=True). Warning inside
+        # that context would be captured in `caught` and never reach callers.
+        warnings.warn(
+            "This scikit-learn version does not support penalty=None; "
+            "falling back to the default L2-regularized model. The "
+            "estimated GPS will be shrunk toward zero. Upgrade "
+            "scikit-learn to obtain unregularized estimates.",
+            RuntimeWarning,
+        )
 
     n_iter = getattr(model, "n_iter_", [None])[0]
 
