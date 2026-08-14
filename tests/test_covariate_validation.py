@@ -100,6 +100,20 @@ def test_missing_covariate_column_is_named(fitted):
         )
 
 
+def test_duplicated_covariates_are_rejected_explicitly(fitted):
+    frame, _, _ = fitted
+
+    with pytest.raises(
+        ValueError,
+        match=r"Duplicated covariate column\(s\).*a",
+    ):
+        samatch.get_pooled_covariance(
+            frame,
+            X_vars=["a", "b", "a"],
+            treatment_var="T",
+        )
+
+
 def test_singular_but_finite_covariance_still_uses_pinv(fitted):
     """The fallback must remain reachable for genuine rank deficiency."""
     frame, _, _ = fitted

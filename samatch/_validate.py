@@ -67,6 +67,20 @@ def require_rows(rows, level, treatment_var):
 
 def require_covariates(data, X_vars):
     """Raise if any covariate column is absent from `data`."""
+    seen = set()
+    duplicates = []
+
+    for covariate in X_vars:
+        if covariate in seen and covariate not in duplicates:
+            duplicates.append(covariate)
+        seen.add(covariate)
+
+    if duplicates:
+        raise ValueError(
+            "Duplicated covariate column(s) in 'X_vars': "
+            + ", ".join(map(str, duplicates))
+        )
+
     missing = [covariate for covariate in X_vars if covariate not in data.columns]
 
     if missing:
