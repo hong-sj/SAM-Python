@@ -15,10 +15,17 @@ resulting diff carefully.
 """
 
 import pathlib
+import sys
 
-import samatch
+# Pin the import to this checkout. Running from tests/ would otherwise pick up
+# an installed samatch from site-packages and regenerate the fixtures from the
+# wrong source.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _golden_pipeline import run_four_group, run_three_group
+import samatch  # noqa: E402
+
+from _golden_pipeline import run_four_group, run_three_group  # noqa: E402
 
 GOLDEN_DIR = pathlib.Path(__file__).parent / "golden"
 

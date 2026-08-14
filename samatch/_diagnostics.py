@@ -33,8 +33,13 @@ def compute_smd_balance(data, matched, X_vars, groups):
     dict
         Dictionary containing:
 
-        - ``by_covariate``: SMD for each covariate and comparator group.
-        - ``summary``: mean and maximum absolute SMD for each comparator group.
+        - ``by_covariate``: SMD for each covariate and comparator group, with
+          an ``smd_defined`` flag that is False when a covariate has no
+          variance in either arm.
+        - ``summary``: mean and maximum absolute SMD for each comparator
+          group, plus ``n_undefined``, the number of covariates that could
+          not be assessed. Undefined covariates are excluded from the mean
+          and maximum rather than propagating a NaN.
     """
     rows = []
 
@@ -50,8 +55,15 @@ def compute_smd_balance(data, matched, X_vars, groups):
             var_anchor = x_anchor[covariate].var(ddof=1)
             var_group = x_group[covariate].var(ddof=1)
 
-            smd = (mean_anchor - mean_group) / np.sqrt(
-                (var_anchor + var_group) / 2
+            pooled_sd = np.sqrt((var_anchor + var_group) / 2)
+
+            # A covariate with no variance in either arm has no defined SMD.
+            # Reporting 0.0 keeps it out of the summary statistics without
+            # emitting a NaN that would then be silently skipped.
+            smd = (
+                (mean_anchor - mean_group) / pooled_sd
+                if pooled_sd > 0
+                else 0.0
             )
 
             rows.append(
@@ -59,6 +71,7 @@ def compute_smd_balance(data, matched, X_vars, groups):
                     "group": group,
                     "covariate": covariate,
                     "smd": smd,
+                    "smd_defined": bool(pooled_sd > 0),
                 }
             )
 
@@ -67,16 +80,19 @@ def compute_smd_balance(data, matched, X_vars, groups):
     summary_rows = []
 
     for group in groups:
-        values = by_covariate.loc[
-            by_covariate["group"] == group,
-            "smd",
-        ].abs()
+        group_rows = by_covariate.loc[by_covariate["group"] == group]
+        defined = group_rows.loc[group_rows["smd_defined"]]
+        values = defined["smd"].abs()
 
         summary_rows.append(
             {
                 "group": group,
                 "mean_abs_smd": values.mean(),
                 "max_abs_smd": values.max(),
+                # Covariates with no variance in either arm cannot be
+                # assessed; counting them keeps that visible rather than
+                # letting the summary look complete.
+                "n_undefined": int((~group_rows["smd_defined"]).sum()),
             }
         )
 
