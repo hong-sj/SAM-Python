@@ -8,7 +8,12 @@ import numpy as np
 import pandas as pd
 
 from ._mahalanobis import get_pooled_covariance, mahalanobis_distance_matrix
-from ._validate import require_rows, treatment_labels, treatment_level
+from ._validate import (
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+)
 
 
 def sam_match(
@@ -50,15 +55,6 @@ def sam_match(
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
-    missing_covariates = [
-        covariate for covariate in X_vars if covariate not in data.columns
-    ]
-    if missing_covariates:
-        raise ValueError(
-            "Covariate column(s) not found in data: "
-            + ", ".join(missing_covariates)
-        )
-
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
     groups = list(search["groups"])
     candidates = search["candidates"]
@@ -77,11 +73,11 @@ def sam_match(
         for group in groups
     }
 
-    x_anchor = data.iloc[anchor_rows][X_vars].to_numpy(dtype=float)
-    x_group = {
-        group: data.iloc[group_rows[group]][X_vars].to_numpy(dtype=float)
-        for group in groups
-    }
+    # Materialise the covariates once and slice with numpy rather than
+    # rebuilding an intermediate DataFrame per group.
+    X = covariate_matrix(data, X_vars)
+    x_anchor = X[anchor_rows]
+    x_group = {group: X[group_rows[group]] for group in groups}
 
     # Convert global candidate rows to within-group positions and calculate
     # Mahalanobis distances only for GPS-screened candidates.

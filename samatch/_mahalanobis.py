@@ -6,7 +6,7 @@ import warnings
 
 import numpy as np
 
-from ._validate import require_rows, treatment_labels
+from ._validate import covariate_matrix, require_rows, treatment_labels
 
 
 def get_pooled_covariance(data, X_vars, treatment_var):
@@ -34,15 +34,25 @@ def get_pooled_covariance(data, X_vars, treatment_var):
         - ``S``: pooled within-group covariance matrix.
         - ``S_inv``: inverse covariance matrix.
     """
+    X = covariate_matrix(data, X_vars)
     treatment = treatment_labels(data, treatment_var)
 
     groups = np.unique(treatment)
     p = len(X_vars)
 
+    df = len(data) - len(groups)
+
+    if df <= 0:
+        raise ValueError(
+            "insufficient residual degrees of freedom to estimate the pooled "
+            f"covariance matrix: {len(data)} rows across {len(groups)} "
+            "treatment groups. Each group needs more than one subject."
+        )
+
     S_within = np.zeros((p, p))
 
     for group in groups:
-        X_group = data.loc[treatment == group, X_vars].to_numpy(dtype=float)
+        X_group = X[treatment == group]
 
         X_centered = X_group - X_group.mean(
             axis=0,
@@ -51,12 +61,18 @@ def get_pooled_covariance(data, X_vars, treatment_var):
 
         S_within += X_centered.T @ X_centered
 
-    df = len(data) - len(groups)
     S = S_within / df
 
+    # numpy.linalg.inv does not raise on every degenerate input -- notably it
+    # returns an all-NaN matrix rather than raising -- so the result is
+    # checked explicitly instead of relying solely on the exception.
     try:
         S_inv = np.linalg.inv(S)
+        degenerate = not np.isfinite(S_inv).all()
     except np.linalg.LinAlgError:
+        degenerate = True
+
+    if degenerate:
         warnings.warn(
             "Pooled covariance matrix is numerically singular; "
             "falling back to numpy.linalg.pinv().",
@@ -176,20 +192,17 @@ def build_group_distance_matrices(
         for group in groups
     }
 
-    X_anchor = data.iloc[anchor_rows][
-        X_vars
-    ].to_numpy(dtype=float)
+    # Materialise the covariates once and slice with numpy rather than
+    # rebuilding an intermediate DataFrame per group.
+    X = covariate_matrix(data, X_vars)
+    X_anchor = X[np.asarray(anchor_rows, dtype=int)]
 
     distance_matrices = {}
 
     for group in groups:
-        X_group = data.iloc[group_rows[group]][
-            X_vars
-        ].to_numpy(dtype=float)
-
         distance_matrices[group] = mahalanobis_distance_matrix(
             X_anchor,
-            X_group,
+            X[group_rows[group]],
             pooled["S_inv"],
         )
 

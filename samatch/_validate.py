@@ -8,6 +8,7 @@ and produce an empty or wrong result rather than an error.
 """
 
 import numpy as np
+import pandas as pd
 
 
 def treatment_labels(data, treatment_var):
@@ -60,6 +61,79 @@ def require_rows(rows, level, treatment_var):
         )
 
     return rows
+
+
+def require_covariates(data, X_vars):
+    """Raise if any covariate column is absent from `data`."""
+    missing = [covariate for covariate in X_vars if covariate not in data.columns]
+
+    if missing:
+        raise ValueError(
+            "Covariate column(s) not found in data: " + ", ".join(missing)
+        )
+
+
+def covariate_matrix(data, X_vars, rows=None):
+    """
+    Return covariates as a float matrix, validating that they are usable.
+
+    Non-numeric and non-finite covariates are rejected here with a message
+    naming the offending columns. Reaching the linear algebra with `NaN`
+    present is not detectable downstream: `numpy.linalg.inv` returns an
+    all-`NaN` matrix without raising, so a single missing value silently
+    destroys every Mahalanobis distance.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Data containing the covariates.
+    X_vars : list of str
+        Covariate column names.
+    rows : array-like of int, optional
+        Positional row indices to restrict the returned matrix to.
+        Validation always covers the whole column, since the pooled
+        covariance uses every row.
+
+    Returns
+    -------
+    numpy.ndarray
+        Covariate matrix of shape ``(n_rows, len(X_vars))``.
+    """
+    require_covariates(data, X_vars)
+
+    frame = data[X_vars]
+
+    non_numeric = [
+        covariate
+        for covariate in X_vars
+        if not pd.api.types.is_numeric_dtype(frame[covariate])
+    ]
+
+    if non_numeric:
+        raise ValueError(
+            "Covariate column(s) are not numeric: "
+            + ", ".join(non_numeric)
+            + ". Categorical covariates must be encoded (for example with "
+            "pandas.get_dummies) before being passed as X_vars."
+        )
+
+    values = frame.to_numpy(dtype=float)
+    finite = np.isfinite(values)
+
+    if not finite.all():
+        offending = [
+            f"{covariate} ({int((~finite[:, position]).sum())} rows)"
+            for position, covariate in enumerate(X_vars)
+            if not finite[:, position].all()
+        ]
+        raise ValueError(
+            "Covariate column(s) contain missing or non-finite values: "
+            + ", ".join(offending)
+            + ". SAM does not impute; drop or impute these rows before "
+            "matching."
+        )
+
+    return values if rows is None else values[np.asarray(rows, dtype=int)]
 
 
 def require_positive_int(value, name):
