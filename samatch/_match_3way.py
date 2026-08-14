@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from scipy.special import logit as _qlogis
 
+from ._validate import require_positive_int
+
 
 def calc_caliper_3way(ps_used, treatment_var_values):
     """
@@ -286,6 +288,8 @@ def match_3way(
     if len(gps) != len(data):
         raise ValueError("gps and data must contain the same number of rows")
 
+    top_n = require_positive_int(top_n, "top_n")
+
     groups = list(search["groups"])
 
     if len(groups) != 2:
@@ -350,9 +354,6 @@ def match_3way(
 
     if caliper <= 0:
         raise ValueError("`caliper` must be greater than zero.")
-
-    if top_n <= 0:
-        raise ValueError("`top_n` must be greater than zero.")
 
     # Use the smallest treatment group as the search base.
     rows_by_level = {

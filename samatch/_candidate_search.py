@@ -9,6 +9,8 @@ score (GPS) space.
 import numpy as np
 from scipy.special import logit as _qlogis
 
+from ._validate import require_positive_int
+
 
 def gps_candidate_search(
     data,
@@ -60,6 +62,8 @@ def gps_candidate_search(
 
     if len(gps) != len(data):
         raise ValueError("gps and data must contain the same number of rows")
+
+    top_m = require_positive_int(top_m, "top_m")
 
     gps_values = gps.to_numpy(dtype=float)
 
