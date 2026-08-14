@@ -12,7 +12,11 @@ from ._diagnostics import (
     compute_pairwise_treatment_auc,
     compute_smd_balance,
 )
-from ._validate import check_data_fingerprint
+from ._validate import (
+    check_data_fingerprint,
+    check_gps_fingerprint,
+    validate_gps,
+)
 
 
 def _infer_anchor_level(data, anchor_rows, treatment_var):
@@ -106,6 +110,8 @@ def sam_evaluate(
         X_vars = [f"X{i}" for i in range(1, 11)]
 
     check_data_fingerprint(search, data, treatment_var, "sam_evaluate")
+    validate_gps(data, gps, treatment_var, "sam_evaluate")
+    check_gps_fingerprint(search, gps, "sam_evaluate")
 
     groups = search["groups"]
     matched = match_result["matched"]

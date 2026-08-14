@@ -39,6 +39,12 @@ def treatment_labels(data, treatment_var):
     if treatment_var not in data.columns:
         raise ValueError(f"'{treatment_var}' not found in data")
 
+    if data[treatment_var].isna().any():
+        raise ValueError(
+            f"'{treatment_var}' contains missing treatment labels. "
+            "Drop or impute these rows before matching."
+        )
+
     return data[treatment_var].astype(str).to_numpy()
 
 
@@ -173,7 +179,41 @@ def _ordered_hash(values):
     return hashlib.blake2b(codes.tobytes(), digest_size=16).hexdigest()
 
 
-def data_fingerprint(data, treatment_var):
+def _frame_hash(frame):
+    """Return an order-sensitive digest of a DataFrame's row values."""
+    try:
+        row_hashes = pd.util.hash_pandas_object(
+            frame,
+            index=False,
+        ).to_numpy()
+    except TypeError:
+        # Unrelated metadata columns may legitimately contain lists, dicts, or
+        # other unhashable Python objects. Keep them in the identity check by
+        # falling back to a type-qualified representation instead of making
+        # candidate search reject an otherwise valid analysis frame.
+        normalized = pd.DataFrame(
+            {
+                position: frame.iloc[:, position].map(
+                    lambda value: (
+                        f"{type(value).__module__}."
+                        f"{type(value).__qualname__}:{value!r}"
+                    )
+                )
+                for position in range(frame.shape[1])
+            },
+            index=frame.index,
+        )
+        row_hashes = pd.util.hash_pandas_object(
+            normalized,
+            index=False,
+        ).to_numpy()
+
+    return hashlib.blake2b(
+        row_hashes.tobytes(), digest_size=16
+    ).hexdigest()
+
+
+def data_fingerprint(data, treatment_var, columns=None):
     """
     Return a cheap fingerprint identifying the exact frame used for matching.
 
@@ -182,17 +222,100 @@ def data_fingerprint(data, treatment_var):
     Re-sorting or filtering in between silently repoints those indices at
     different subjects.
 
-    Both the index and the treatment column are hashed order-sensitively.
-    Hashing the index alone would miss a reordering followed by
-    `reset_index(drop=True)`; hashing the treatment column alone would miss a
-    reordering within a treatment group. Other columns are deliberately not
-    hashed, so adding an outcome column between stages stays legal.
+    The index, treatment column, and every column present when the fingerprint
+    is created are hashed order-sensitively. The full row hash is necessary
+    because swapping two subjects within the same treatment group and then
+    resetting the index leaves both the index and treatment sequence unchanged.
+
+    When ``columns`` is supplied, only those columns are hashed. This lets the
+    validation step ignore columns added after candidate search while still
+    verifying that every original row value remains attached to the same
+    position.
     """
+    if columns is None:
+        columns = list(data.columns)
+    else:
+        columns = list(columns)
+
+    missing = [column for column in columns if column not in data.columns]
+
+    if missing:
+        raise ValueError(
+            "Column(s) used to identify the original data are missing: "
+            + ", ".join(map(str, missing))
+        )
+
     return {
         "n_rows": int(len(data)),
         "index_hash": _ordered_hash(data.index),
         "treatment_hash": _ordered_hash(data[treatment_var].astype(str)),
+        "data_columns": columns,
+        "data_hash": _frame_hash(data.loc[:, columns]),
     }
+
+
+def gps_fingerprint(gps):
+    """Return an order-sensitive digest of a GPS DataFrame."""
+    return {
+        "n_rows": int(len(gps)),
+        "index_hash": _ordered_hash(gps.index),
+        "columns_hash": _ordered_hash(gps.columns),
+        "values_hash": _frame_hash(gps),
+    }
+
+
+def validate_gps(data, gps, treatment_var, context):
+    """Validate GPS shape, alignment, and probability values."""
+    if not isinstance(gps, pd.DataFrame):
+        raise TypeError(f"gps passed to {context}() must be a pandas.DataFrame")
+
+    if len(gps) != len(data):
+        raise ValueError("gps and data must contain the same number of rows")
+
+    if not gps.index.equals(data.index):
+        raise ValueError(
+            f"gps and data passed to {context}() must have identical indices "
+            "in the same order. GPS values are matched to subjects by row "
+            "position."
+        )
+
+    if not gps.columns.is_unique:
+        raise ValueError("gps column names must be unique")
+
+    if gps.shape[1] == 0:
+        raise ValueError("gps must contain at least one treatment column")
+
+    try:
+        values = gps.to_numpy(dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError("gps values must be numeric") from error
+
+    if not np.isfinite(values).all():
+        raise ValueError("gps values must all be finite")
+
+    if np.any(values < 0) or np.any(values > 1):
+        raise ValueError("gps values must lie in the interval [0, 1]")
+
+    row_sums = values.sum(axis=1)
+
+    if not np.allclose(row_sums, 1.0, rtol=1e-6, atol=1e-8):
+        raise ValueError("each gps row must sum to 1")
+
+    # Validate the treatment column here as well, before callers derive group
+    # masks from its canonical string representation. Every observed arm must
+    # have a score column; otherwise candidate search would silently omit that
+    # arm and form lower-dimensional matched sets.
+    treatment = treatment_labels(data, treatment_var)
+    missing_levels = [
+        level for level in np.unique(treatment) if level not in gps.columns
+    ]
+
+    if missing_levels:
+        raise ValueError(
+            "Treatment group(s) not found in gps: " + ", ".join(missing_levels)
+        )
+
+    return values
 
 
 def check_data_fingerprint(search, data, treatment_var, context):
@@ -207,13 +330,40 @@ def check_data_fingerprint(search, data, treatment_var, context):
     if expected is None or treatment_var not in data.columns:
         return
 
-    actual = data_fingerprint(data, treatment_var)
+    # Older search objects contain only these three fields. Compare that common
+    # subset so they remain usable, while newer objects also get the stronger
+    # full-row identity check below.
+    actual = data_fingerprint(
+        data,
+        treatment_var,
+        columns=expected.get("data_columns", list(data.columns)),
+    )
+    common_keys = ("n_rows", "index_hash", "treatment_hash")
+    mismatch = any(actual.get(key) != expected.get(key) for key in common_keys)
 
-    if actual != expected:
+    if "data_hash" in expected:
+        mismatch = mismatch or actual["data_hash"] != expected["data_hash"]
+
+    if mismatch:
         raise ValueError(
             f"the data passed to {context}() does not match the data used by "
             "gps_candidate_search(). Matched sets reference positional row "
             "indices, so the same DataFrame must be passed unmodified through "
             "the whole pipeline; re-sorting, filtering or re-indexing in "
             "between silently changes which subjects the results describe."
+        )
+
+
+def check_gps_fingerprint(search, gps, context):
+    """Verify that a later pipeline stage received the GPS used for search."""
+    expected = search.get("gps_fingerprint") if hasattr(search, "get") else None
+
+    if expected is None:
+        return
+
+    if gps_fingerprint(gps) != expected:
+        raise ValueError(
+            f"the gps passed to {context}() does not match the gps used by "
+            "gps_candidate_search(). Use the same GPS DataFrame, with the same "
+            "rows, columns, and values, throughout the pipeline."
         )

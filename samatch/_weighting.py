@@ -6,6 +6,13 @@ import numpy as np
 import pandas as pd
 
 from ._gps import estimate_gps_multinom
+from ._validate import (
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+    validate_gps,
+)
 
 
 def compute_balancing_weights(
@@ -63,9 +70,6 @@ def compute_balancing_weights(
     if method not in ("iptw", "overlap", "matching"):
         raise ValueError('method must be "iptw", "overlap", or "matching"')
 
-    if treatment_var not in data.columns:
-        raise ValueError(f"'{treatment_var}' not found in data")
-
     if gps is None:
         gps = estimate_gps_multinom(
             data,
@@ -74,10 +78,10 @@ def compute_balancing_weights(
             anchor_level=anchor_level,
         )["gps"]
 
-    if len(gps) != len(data):
-        raise ValueError("gps and data must contain the same number of rows")
-
-    treatment = data[treatment_var].astype(str).to_numpy()
+    gps_values = validate_gps(
+        data, gps, treatment_var, "compute_balancing_weights"
+    )
+    treatment = treatment_labels(data, treatment_var)
 
     missing_levels = [
         level for level in np.unique(treatment) if level not in gps.columns

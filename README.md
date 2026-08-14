@@ -286,7 +286,7 @@ The individual diagnostics used by `sam_evaluate()` are also public, and can be 
 ## Requirements on the Input Data
 
 - **Covariates must be numeric and complete.** `X_vars` columns are used directly in linear algebra, so categorical covariates need encoding (for example with `pandas.get_dummies`) and missing values need dropping or imputing first. SAM does not impute.
-- **Pass the same DataFrame through the whole pipeline.** Matched sets reference positional row indices, so `data` must reach `sam_match()`, `sam_evaluate()` and `extract_matched_data()` in the same row order that `gps_candidate_search()` saw. This is checked, and a modified frame raises rather than producing a report about the wrong subjects. Adding a column between stages is fine.
+- **Pass the same DataFrame and GPS through the whole pipeline.** Matched sets reference positional row indices, so `data` and `gps` must keep the same subjects in the same order that `gps_candidate_search()` saw. Original data values and GPS values are fingerprinted; changing, sorting, or re-indexing them raises rather than producing a report about the wrong subjects. Adding a new column to `data` between stages is fine.
 - **Treatment levels are compared as strings.** A numeric treatment column works, and `anchor_level` may be given either as `0` or as `"0"`.
 
 ---

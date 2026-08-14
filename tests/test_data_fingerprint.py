@@ -38,6 +38,8 @@ def test_search_records_a_fingerprint(pipeline):
         "n_rows",
         "index_hash",
         "treatment_hash",
+        "data_columns",
+        "data_hash",
     }
 
 
@@ -113,6 +115,29 @@ def test_reordering_within_a_group_is_detected(pipeline):
         )
 
 
+def test_reordering_within_a_group_then_resetting_index_is_detected(pipeline):
+    """Index and treatment hashes alone cannot detect this permutation."""
+    frame, fit, search, matched = pipeline
+
+    positions = np.flatnonzero(frame["T"].to_numpy() == frame.loc[0, "T"])
+    order = np.arange(len(frame))
+    order[positions[:2]] = order[positions[:2]][::-1]
+    reordered = frame.iloc[order].reset_index(drop=True)
+
+    assert reordered.index.equals(frame.index)
+    np.testing.assert_array_equal(reordered["T"], frame["T"])
+
+    with pytest.raises(ValueError, match="does not match the data"):
+        samatch.sam_evaluate(
+            reordered,
+            search,
+            matched,
+            fit["gps"],
+            X_vars=list("abc"),
+            treatment_var="T",
+        )
+
+
 def test_adding_a_column_between_stages_is_allowed(pipeline):
     """Only row order matters, so attaching an outcome must stay legal."""
     frame, fit, search, matched = pipeline
@@ -127,6 +152,22 @@ def test_adding_a_column_between_stages_is_allowed(pipeline):
     )
 
     assert report["matching_rate"] == matched["matching_rate"]
+
+
+def test_unhashable_metadata_does_not_break_fingerprinting():
+    frame = pd.DataFrame(
+        {
+            "T": ["A", "B", "B"],
+            "metadata": [["anchor"], {"site": 1}, ["comparator"]],
+        }
+    )
+    gps = pd.DataFrame(
+        {"A": [0.8, 0.3, 0.2], "B": [0.2, 0.7, 0.8]},
+        index=frame.index,
+    )
+
+    search = samatch.gps_candidate_search(frame, gps, anchor_level="A")
+    assert "data_hash" in search["data_fingerprint"]
 
 
 def test_the_unmodified_frame_still_works(pipeline):
@@ -149,6 +190,27 @@ def test_a_search_without_a_fingerprint_is_still_accepted(pipeline):
     frame, fit, search, matched = pipeline
 
     legacy = {k: v for k, v in search.items() if k != "data_fingerprint"}
+
+    report = samatch.sam_evaluate(
+        frame,
+        legacy,
+        matched,
+        fit["gps"],
+        X_vars=list("abc"),
+        treatment_var="T",
+    )
+
+    assert report["matching_rate"] == matched["matching_rate"]
+
+
+def test_a_search_with_the_legacy_fingerprint_is_still_accepted(pipeline):
+    """Search objects from before full-row hashing remain usable."""
+    frame, fit, search, matched = pipeline
+    legacy = dict(search)
+    legacy["data_fingerprint"] = {
+        key: search["data_fingerprint"][key]
+        for key in ("n_rows", "index_hash", "treatment_hash")
+    }
 
     report = samatch.sam_evaluate(
         frame,

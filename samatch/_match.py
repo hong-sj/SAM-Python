@@ -69,6 +69,9 @@ def sam_match(
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
 
+    # Preserve the specific, actionable covariate error when a caller both
+    # changes a value and makes it unusable (for example by inserting NaN).
+    X = covariate_matrix(data, X_vars)
     check_data_fingerprint(search, data, treatment_var, "sam_match")
 
     anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
@@ -91,7 +94,6 @@ def sam_match(
 
     # Materialise the covariates once and slice with numpy rather than
     # rebuilding an intermediate DataFrame per group.
-    X = covariate_matrix(data, X_vars)
     x_anchor = X[anchor_rows]
     x_group = {group: X[group_rows[group]] for group in groups}
 

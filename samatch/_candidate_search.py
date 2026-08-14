@@ -12,10 +12,12 @@ from scipy.spatial import cKDTree
 from ._match_common import transform_ps
 from ._validate import (
     data_fingerprint,
+    gps_fingerprint,
     require_positive_int,
     require_rows,
     treatment_labels,
     treatment_level,
+    validate_gps,
 )
 
 
@@ -150,6 +152,9 @@ def gps_candidate_search(
           comparator group.
         - ``data_fingerprint``: identifies the frame these positional indices
           refer to, so later stages can reject a modified `data`.
+        - ``gps_fingerprint``: identifies the GPS matrix used for candidate
+          selection, so evaluation and three-way matching can reject a
+          different matrix.
 
     Notes
     -----
@@ -158,13 +163,11 @@ def gps_candidate_search(
     `extract_matched_data()`; re-sorting or filtering it in between would
     repoint those indices at different subjects.
     """
-    if len(gps) != len(data):
-        raise ValueError("gps and data must contain the same number of rows")
-
     top_m = require_positive_int(top_m, "top_m")
     anchor_level = treatment_level(anchor_level)
 
-    gps_used = transform_ps(gps.to_numpy(dtype=float), gps_space)
+    gps_values = validate_gps(data, gps, treatment_var, "gps_candidate_search")
+    gps_used = transform_ps(gps_values, gps_space)
 
     groups = [
         group for group in gps.columns if treatment_level(group) != anchor_level
@@ -212,6 +215,7 @@ def gps_candidate_search(
     return {
         "anchor_rows": anchor_rows,
         "data_fingerprint": data_fingerprint(data, treatment_var),
+        "gps_fingerprint": gps_fingerprint(gps),
         "groups": groups,
         "candidates": candidates,
     }
