@@ -6,10 +6,17 @@ using a two-dimensional propensity score space, KD-tree candidate search,
 a perimeter-based caliper, and global greedy selection.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
-from scipy.special import logit as _qlogis
 
+from ._match_common import (
+    build_matched_frame,
+    max_possible_rate,
+    summarize_matching,
+    transform_ps,
+)
 from ._validate import check_data_fingerprint, require_positive_int
 
 
@@ -226,9 +233,10 @@ def match_3way(
     X_vars=None,
     treatment_var="T",
     caliper="auto",
-    ps_space="raw",
+    gps_space="raw",
     top_n=10,
     reference_level=None,
+    ps_space=None,
 ):
     """
     Perform three-way nearest-neighbor propensity score matching.
@@ -249,20 +257,24 @@ def match_3way(
     gps : pandas.DataFrame
         Generalized propensity score matrix.
     X_vars : list of str, optional
-        Included for interface compatibility with `sam_match()`. Not used
-        by the three-way propensity score matching algorithm.
+        Included for interface compatibility with `sam_match()`. Not used by
+        the three-way propensity score matching algorithm; passing it emits a
+        `UserWarning`.
     treatment_var : str, default="T"
         Name of the treatment variable.
     caliper : {"auto"} or float, default="auto"
         Perimeter-scale caliper. ``"auto"`` uses `calc_caliper_3way()`.
-    ps_space : {"raw", "logit"}, default="raw"
-        Propensity score scale used for matching.
+    gps_space : {"raw", "logit"}, default="raw"
+        Propensity score scale used for matching. Named to match
+        `gps_candidate_search()`.
     top_n : int, default=10
         Maximum number of candidate trios retained per search-base subject
         during each candidate-generation step.
     reference_level : str, optional
         Treatment group whose GPS column is omitted when constructing the
         two-dimensional propensity score space. Defaults to the last group.
+    ps_space : {"raw", "logit"}, optional
+        Deprecated alias for `gps_space`.
 
     Returns
     -------
@@ -272,15 +284,34 @@ def match_3way(
         - ``matched``: matched trios and distance information.
         - ``unmatched_anchor_rows``: unmatched anchor row indices.
         - ``matching_rate``: proportion of anchor subjects matched.
+        - ``max_possible_rate``: the highest rate the group sizes allow.
         - ``caliper``: caliper used for matching.
         - ``red_level``: smallest treatment group used as the search base.
         - ``reference_level``: treatment group omitted from PS coordinates.
     """
-    # X_vars is retained for interface compatibility with sam_match().
-    _ = X_vars
+    # X_vars is retained for interface compatibility with sam_match(). This
+    # algorithm matches in propensity score space only, so passing covariates
+    # here has no effect and is worth saying out loud.
+    if X_vars is not None:
+        warnings.warn(
+            "match_3way() ignores X_vars: three-way matching operates in "
+            "propensity score space only. Covariates influence the result "
+            "through estimate_gps_multinom() instead.",
+            UserWarning,
+            stacklevel=2,
+        )
 
-    if ps_space not in ("raw", "logit"):
-        raise ValueError('ps_space must be "raw" or "logit"')
+    if ps_space is not None:
+        warnings.warn(
+            "`ps_space` is deprecated; use `gps_space` instead, which is the "
+            "name gps_candidate_search() already uses for the same option.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        gps_space = ps_space
+
+    if gps_space not in ("raw", "logit"):
+        raise ValueError('gps_space must be "raw" or "logit"')
 
     if treatment_var not in data.columns:
         raise ValueError(f"'{treatment_var}' not found in data")
@@ -336,13 +367,7 @@ def match_3way(
         level for level in all_levels if level != reference_level
     ]
 
-    ps_raw = gps[ps_levels].to_numpy(dtype=float)
-
-    if ps_space == "logit":
-        eps = 1e-6
-        ps_used = _qlogis(np.clip(ps_raw, eps, 1 - eps))
-    else:
-        ps_used = ps_raw
+    ps_used = transform_ps(gps[ps_levels].to_numpy(dtype=float), gps_space)
 
     if isinstance(caliper, str):
         if caliper != "auto":
@@ -648,42 +673,20 @@ def match_3way(
             if counters[red_idx_local] <= 0 and not exhausted[red_idx_local]:
                 push_candidates(red_idx_local)
 
-    if matched_rows:
-        matched = pd.DataFrame(matched_rows)
-    else:
-        columns = [
-            "matched_set_id",
-            "anchor",
-            *groups,
-            *[f"dist_{group}" for group in groups],
-            "loss",
-            "rassen_perimeter",
-        ]
-        matched = pd.DataFrame(columns=columns)
-
-    if len(matched) > 0:
-        matched_anchor_rows = set(matched["anchor"].tolist())
-    else:
-        matched_anchor_rows = set()
-
-    unmatched_anchor_rows = np.asarray(
-        [
-            row
-            for row in anchor_rows
-            if row not in matched_anchor_rows
-        ],
-        dtype=int,
+    matched = build_matched_frame(
+        matched_rows, groups, extra_columns=("rassen_perimeter",)
     )
-
-    if len(anchor_rows) > 0:
-        matching_rate = len(matched) / len(anchor_rows)
-    else:
-        matching_rate = float("nan")
+    unmatched_anchor_rows, matching_rate = summarize_matching(
+        matched, anchor_rows
+    )
 
     return {
         "matched": matched,
         "unmatched_anchor_rows": unmatched_anchor_rows,
         "matching_rate": matching_rate,
+        "max_possible_rate": max_possible_rate(
+            {group: rows_by_level[group] for group in groups}, anchor_rows
+        ),
         "caliper": caliper,
         "red_level": red_level,
         "reference_level": reference_level,

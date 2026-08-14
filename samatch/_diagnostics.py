@@ -7,10 +7,11 @@ import itertools
 import numpy as np
 import pandas as pd
 
+from ._match_common import groups_from_matched
 from ._utils_math import auc_mannwhitney
 
 
-def compute_smd_balance(data, matched, X_vars, groups):
+def compute_smd_balance(data, matched, X_vars=None, groups=None):
     """
     Compute standardized mean difference balance after matching.
 
@@ -23,10 +24,10 @@ def compute_smd_balance(data, matched, X_vars, groups):
         Original data containing the covariates.
     matched : pandas.DataFrame
         Matched-set data returned by `sam_match()` or `match_3way()`.
-    X_vars : list of str
-        Covariate column names.
-    groups : list of str
-        Comparator treatment groups.
+    X_vars : list of str, optional
+        Covariate column names. Defaults to X1 through X10.
+    groups : list of str, optional
+        Comparator treatment groups. Inferred from `matched` if omitted.
 
     Returns
     -------
@@ -41,6 +42,12 @@ def compute_smd_balance(data, matched, X_vars, groups):
           not be assessed. Undefined covariates are excluded from the mean
           and maximum rather than propagating a NaN.
     """
+    if X_vars is None:
+        X_vars = [f"X{i}" for i in range(1, 11)]
+
+    if groups is None:
+        groups = groups_from_matched(matched)
+
     rows = []
 
     x_anchor = data.iloc[matched["anchor"].to_numpy()][X_vars]
@@ -104,7 +111,7 @@ def compute_smd_balance(data, matched, X_vars, groups):
     }
 
 
-def compute_pairwise_treatment_auc(gps, matched, groups, anchor_level):
+def compute_pairwise_treatment_auc(gps, matched, groups=None, anchor_level=None):
     """
     Compute pairwise treatment-discrimination AUC after matching.
 
@@ -118,8 +125,8 @@ def compute_pairwise_treatment_auc(gps, matched, groups, anchor_level):
         Generalized propensity score matrix.
     matched : pandas.DataFrame
         Matched-set data returned by `sam_match()` or `match_3way()`.
-    groups : list of str
-        Comparator treatment groups.
+    groups : list of str, optional
+        Comparator treatment groups. Inferred from `matched` if omitted.
     anchor_level : str
         Anchor treatment group.
 
@@ -130,7 +137,19 @@ def compute_pairwise_treatment_auc(gps, matched, groups, anchor_level):
 
         - ``pairwise``: pairwise AUC for each treatment-group comparison.
         - ``mean_auc``: mean pairwise AUC.
+
+    Notes
+    -----
+    Subjects are scored with the GPS model as fitted, on the same subjects it
+    was fitted to. The reported AUC therefore measures residual separation
+    after matching, not held-out discrimination.
     """
+    if groups is None:
+        groups = groups_from_matched(matched)
+
+    if anchor_level is None:
+        raise ValueError("`anchor_level` is required")
+
     all_levels = [anchor_level] + list(groups)
 
     rows_by_level = {

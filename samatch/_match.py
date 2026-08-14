@@ -8,6 +8,11 @@ import numpy as np
 import pandas as pd
 
 from ._mahalanobis import get_pooled_covariance, mahalanobis_distance_matrix
+from ._match_common import (
+    build_matched_frame,
+    max_possible_rate,
+    summarize_matching,
+)
 from ._validate import (
     check_data_fingerprint,
     covariate_matrix,
@@ -52,6 +57,14 @@ def sam_match(
         - ``unmatched_anchor_rows``: row indices of unmatched anchors.
         - ``matching_rate``: proportion of anchor subjects successfully
           matched.
+        - ``max_possible_rate``: the highest rate the group sizes allow.
+
+    Notes
+    -----
+    Every matched set consumes one subject from each comparator group, so
+    ``matching_rate`` cannot exceed the size of the smallest comparator group
+    divided by the anchor count. Compare it against ``max_possible_rate``
+    before reading a low rate as a poor match.
     """
     if X_vars is None:
         X_vars = [f"X{i}" for i in range(1, 11)]
@@ -277,36 +290,14 @@ def sam_match(
             if anchor_active[i]:
                 recompute(i)
 
-    if matched_rows:
-        matched = pd.DataFrame(matched_rows)
-    else:
-        columns = [
-            "matched_set_id",
-            "anchor",
-            *groups,
-            *[f"dist_{group}" for group in groups],
-            "loss",
-        ]
-        matched = pd.DataFrame(columns=columns)
-
-    if len(matched) > 0:
-        matched_anchor_rows = set(matched["anchor"].tolist())
-    else:
-        matched_anchor_rows = set()
-
-    unmatched_anchor_rows = np.asarray(
-        [
-            row
-            for row in anchor_rows
-            if row not in matched_anchor_rows
-        ],
-        dtype=int,
+    matched = build_matched_frame(matched_rows, groups)
+    unmatched_anchor_rows, matching_rate = summarize_matching(
+        matched, anchor_rows
     )
-
-    matching_rate = len(matched) / n_anchor if n_anchor > 0 else float("nan")
 
     return {
         "matched": matched,
         "unmatched_anchor_rows": unmatched_anchor_rows,
         "matching_rate": matching_rate,
+        "max_possible_rate": max_possible_rate(group_rows, anchor_rows),
     }

@@ -108,10 +108,9 @@ def run_three_group():
         data,
         search,
         fit["gps"],
-        X_vars=covariates,
         treatment_var="treatment",
         caliper="auto",
-        ps_space="raw",
+        gps_space="raw",
         top_n=10,
     )
 

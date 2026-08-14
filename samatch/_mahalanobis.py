@@ -9,7 +9,7 @@ import numpy as np
 from ._validate import covariate_matrix, require_rows, treatment_labels
 
 
-def get_pooled_covariance(data, X_vars, treatment_var):
+def get_pooled_covariance(data, X_vars=None, treatment_var="T"):
     """
     Compute the pooled within-group covariance matrix.
 
@@ -21,9 +21,9 @@ def get_pooled_covariance(data, X_vars, treatment_var):
     ----------
     data : pandas.DataFrame
         Data containing the covariates and treatment variable.
-    X_vars : list of str
-        Covariate column names.
-    treatment_var : str
+    X_vars : list of str, optional
+        Covariate column names. Defaults to X1 through X10.
+    treatment_var : str, default="T"
         Name of the treatment variable.
 
     Returns
@@ -34,6 +34,9 @@ def get_pooled_covariance(data, X_vars, treatment_var):
         - ``S``: pooled within-group covariance matrix.
         - ``S_inv``: inverse covariance matrix.
     """
+    if X_vars is None:
+        X_vars = [f"X{i}" for i in range(1, 11)]
+
     X = covariate_matrix(data, X_vars)
     treatment = treatment_labels(data, treatment_var)
 

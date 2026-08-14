@@ -398,19 +398,18 @@ def test_kdtree_range():
 
 
 @pytest.mark.parametrize(
-    "ps_space",
+    "gps_space",
     ["raw", "logit"],
 )
-def test_match_3way(three_group_data, ps_space):
-    covariates, _, fit, search = fit_and_search(three_group_data)
+def test_match_3way(three_group_data, gps_space):
+    _, _, fit, search = fit_and_search(three_group_data)
 
     result = samatch.match_3way(
         three_group_data,
         search,
         fit["gps"],
-        X_vars=covariates,
         treatment_var="treatment",
-        ps_space=ps_space,
+        gps_space=gps_space,
     )
 
     matched = result["matched"]
@@ -443,7 +442,6 @@ def test_match_3way_integrates_with_sam_evaluate(three_group_data):
         three_group_data,
         search,
         fit["gps"],
-        X_vars=covariates,
         treatment_var="treatment",
     )
 
@@ -474,7 +472,6 @@ def test_match_3way_caliper_monotonicity(three_group_data):
         three_group_data,
         search,
         fit["gps"],
-        X_vars=covariates,
         treatment_var="treatment",
         caliper=0.05,
     )
@@ -483,7 +480,6 @@ def test_match_3way_caliper_monotonicity(three_group_data):
         three_group_data,
         search,
         fit["gps"],
-        X_vars=covariates,
         treatment_var="treatment",
         caliper=999.0,
     )

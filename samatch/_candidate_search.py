@@ -8,8 +8,8 @@ score (GPS) space.
 
 import numpy as np
 from scipy.spatial import cKDTree
-from scipy.special import logit as _qlogis
 
+from ._match_common import transform_ps
 from ._validate import (
     data_fingerprint,
     require_positive_int,
@@ -158,23 +158,13 @@ def gps_candidate_search(
     `extract_matched_data()`; re-sorting or filtering it in between would
     repoint those indices at different subjects.
     """
-    if gps_space not in ("raw", "logit"):
-        raise ValueError('gps_space must be "raw" or "logit"')
-
     if len(gps) != len(data):
         raise ValueError("gps and data must contain the same number of rows")
 
     top_m = require_positive_int(top_m, "top_m")
     anchor_level = treatment_level(anchor_level)
 
-    gps_values = gps.to_numpy(dtype=float)
-
-    # Transform GPS values to the logit scale if requested.
-    if gps_space == "logit":
-        eps = 1e-6
-        gps_used = _qlogis(np.clip(gps_values, eps, 1 - eps))
-    else:
-        gps_used = gps_values
+    gps_used = transform_ps(gps.to_numpy(dtype=float), gps_space)
 
     groups = [
         group for group in gps.columns if treatment_level(group) != anchor_level
