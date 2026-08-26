@@ -313,7 +313,7 @@ data4 = load_sample_4group()
 
 If you use SAM-Python in your research, please cite:
 
-> Hong S, Hong S, Lee KH, Cha N. **SAM-Python: Shared Anchor Matching**. Version 0.1.0. Zenodo. https://doi.org/10.5281/zenodo.21926925
+> Hong S, Hong S, Lee KH, Cha N, Park S. **SAM-Python: Shared Anchor Matching**. Version 0.1.0. Zenodo. https://doi.org/10.5281/zenodo.21926925
 
 A formal citation for the associated methodological paper will be added upon publication.
 
