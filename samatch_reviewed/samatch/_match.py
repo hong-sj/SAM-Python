@@ -1,0 +1,339 @@
+"""
+Core Shared Anchor Matching algorithm.
+"""
+
+import heapq
+
+import numpy as np
+import pandas as pd
+
+from ._mahalanobis import get_pooled_covariance
+from ._match_common import (
+    ORDER_GRID,
+    build_matched_frame,
+    max_possible_rate,
+    order_key,
+    summarize_matching,
+)
+from ._validate import (
+    check_data_fingerprint,
+    covariate_matrix,
+    require_rows,
+    treatment_labels,
+    treatment_level,
+)
+
+
+def _whitening_matrix(s_inv):
+    """
+    Return W with ``W @ W.T == s_inv``.
+
+    The eigendecomposition is used rather than a Cholesky factor because the
+    pooled precision may come from the pseudo-inverse fallback and be only
+    positive semi-definite.
+    """
+    eigenvalues, eigenvectors = np.linalg.eigh((s_inv + s_inv.T) / 2)
+    return eigenvectors * np.sqrt(np.clip(eigenvalues, 0.0, None))
+
+
+def sam_match(
+    data,
+    search,
+    X_vars=None,
+    treatment_var="T",
+):
+    """
+    Match multiple treatment groups to a shared anchor group.
+
+    For each anchor subject, SAM identifies the nearest available candidate
+    from every comparator group in Mahalanobis space. Matched sets are then
+    selected globally in ascending total-distance loss without replacement.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Data containing the covariates and treatment variable.
+    search : dict
+        Output from `gps_candidate_search()`.
+    X_vars : list of str, optional
+        Covariate column names used for Mahalanobis distance.
+        Defaults to X1 through X10.
+    treatment_var : str, default="T"
+        Name of the treatment variable.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+
+        - ``matched``: successfully matched sets, row indices,
+          group-specific Mahalanobis distances, and total loss.
+        - ``unmatched_anchor_rows``: row indices of unmatched anchors.
+        - ``matching_rate``: proportion of anchor subjects successfully
+          matched.
+        - ``max_possible_rate``: the highest rate the group sizes allow.
+
+    Notes
+    -----
+    Every matched set consumes one subject from each comparator group, so
+    ``matching_rate`` cannot exceed the size of the smallest comparator group
+    divided by the anchor count. Compare it against ``max_possible_rate``
+    before reading a low rate as a poor match.
+    """
+    if X_vars is None:
+        X_vars = [f"X{i}" for i in range(1, 11)]
+
+    # Preserve the specific, actionable covariate error when a caller both
+    # changes a value and makes it unusable (for example by inserting NaN).
+    X = covariate_matrix(data, X_vars)
+    check_data_fingerprint(search, data, treatment_var, "sam_match")
+
+    anchor_rows = np.asarray(search["anchor_rows"], dtype=int)
+    groups = list(search["groups"])
+    candidates = search["candidates"]
+    n_anchor = len(anchor_rows)
+
+    pooled = get_pooled_covariance(data, X_vars, treatment_var)
+    s_inv = pooled["S_inv"]
+
+    treatment = treatment_labels(data, treatment_var)
+    group_rows = {
+        group: require_rows(
+            np.flatnonzero(treatment == treatment_level(group)),
+            group,
+            treatment_var,
+        )
+        for group in groups
+    }
+
+    # Distances are computed in whitened coordinates: with
+    # S_inv = W W', the Mahalanobis distance is the Euclidean distance between
+    # rows of (X - mean) W. Differencing first avoids the cancellation in the
+    # expanded form |a|^2 + |b|^2 - 2ab, whose error grows with the squared
+    # covariate magnitude (a calendar year, say) and can reach the size of a
+    # real distance difference. Centering does not change any distance.
+    whitener = _whitening_matrix(s_inv)
+    Z = (X - X.mean(axis=0)) @ whitener
+    z_anchor = Z[anchor_rows]
+
+    candidate_local = {}
+    candidate_distance = {}
+
+    for group in groups:
+        rows_of_group = group_rows[group]
+
+        position_in_group = np.full(len(data), -1, dtype=int)
+        position_in_group[rows_of_group] = np.arange(len(rows_of_group))
+
+        per_anchor = [
+            position_in_group[np.asarray(candidates[i][group], dtype=int)]
+            for i in range(n_anchor)
+        ]
+        per_anchor = [
+            positions[positions >= 0] for positions in per_anchor
+        ]
+
+        counts = np.fromiter(
+            (len(positions) for positions in per_anchor),
+            dtype=int,
+            count=n_anchor,
+        )
+        flat_candidate = (
+            np.concatenate(per_anchor)
+            if n_anchor
+            else np.empty(0, dtype=int)
+        )
+        flat_anchor = np.repeat(np.arange(n_anchor), counts)
+
+        difference = (
+            z_anchor[flat_anchor] - Z[group_rows[group]][flat_candidate]
+        )
+        flat_distance = np.sqrt(np.einsum("ij,ij->i", difference, difference))
+
+        # One global ordering in place of a stable sort per anchor. Within an
+        # anchor's contiguous block, ranking by position is the same tie-break
+        # a per-anchor stable sort applies, so the permutation is unchanged.
+        # Ranking uses the snapped key (see `order_key`), so candidates at
+        # mathematically equal distances fall back to GPS-screening order
+        # rather than to rounding noise.
+        order = np.lexsort(
+            (np.arange(len(flat_distance)), order_key(flat_distance), flat_anchor)
+        )
+        boundaries = np.cumsum(counts)[:-1]
+
+        candidate_local[group] = np.split(flat_candidate[order], boundaries)
+        candidate_distance[group] = np.split(flat_distance[order], boundaries)
+
+    active = {
+        group: np.ones(len(group_rows[group]), dtype=bool)
+        for group in groups
+    }
+    pointer = {
+        group: np.zeros(n_anchor, dtype=int)
+        for group in groups
+    }
+
+    anchor_active = np.ones(n_anchor, dtype=bool)
+    best_loss = np.full(n_anchor, np.inf)
+    best_key = np.full(n_anchor, np.inf)
+
+    best_choice = {
+        group: np.full(n_anchor, -1, dtype=int)
+        for group in groups
+    }
+    best_distance = {
+        group: np.full(n_anchor, np.nan)
+        for group in groups
+    }
+
+    version = np.zeros(n_anchor, dtype=np.int64)
+    heap = []
+
+    # Reverse index: which anchors currently have their best match pointing at
+    # a given comparator subject. Without it, consuming a subject would mean
+    # rescanning every remaining anchor to find the few that were relying on
+    # it, which is quadratic in the anchor count.
+    claimants = {
+        group: [set() for _ in range(len(group_rows[group]))]
+        for group in groups
+    }
+
+    def release(i):
+        """Drop anchor `i`'s outstanding claims on comparator subjects."""
+        for group in groups:
+            chosen = int(best_choice[group][i])
+
+            if chosen >= 0:
+                claimants[group][chosen].discard(i)
+                best_choice[group][i] = -1
+
+    def recompute(i):
+        """Recompute the current best available match for one anchor."""
+        release(i)
+
+        total_loss = 0.0
+
+        for group in groups:
+            local_indices = candidate_local[group][i]
+            distances = candidate_distance[group][i]
+            position = int(pointer[group][i])
+
+            while (
+                position < len(local_indices)
+                and not active[group][local_indices[position]]
+            ):
+                position += 1
+
+            pointer[group][i] = position
+
+            if position >= len(local_indices):
+                release(i)
+                best_loss[i] = np.inf
+                best_key[i] = np.inf
+
+                for other_group in groups:
+                    best_distance[other_group][i] = np.nan
+
+                version[i] += 1
+                return
+
+            chosen = int(local_indices[position])
+
+            best_choice[group][i] = chosen
+            claimants[group][chosen].add(i)
+            best_distance[group][i] = float(distances[position])
+            total_loss += float(distances[position])
+
+        best_loss[i] = total_loss
+        # Anchors are ranked on the snapped loss, then on anchor index: two
+        # anchors whose losses are mathematically equal tie exactly and the
+        # lower index goes first, whatever the rounding noise in the sums.
+        # round() on a Python float is round-half-even, i.e. order_key()
+        # without the per-call numpy dispatch on this hot path.
+        best_key[i] = float(round(total_loss * ORDER_GRID))
+        version[i] += 1
+
+        heapq.heappush(
+            heap,
+            (best_key[i], int(i), int(version[i])),
+        )
+
+    for i in range(n_anchor):
+        recompute(i)
+
+    matched_rows = []
+    n_active_anchor = n_anchor
+
+    while n_active_anchor > 0 and heap:
+        loss, anchor_idx, entry_version = heapq.heappop(heap)
+
+        if not anchor_active[anchor_idx]:
+            continue
+
+        if entry_version != version[anchor_idx]:
+            continue
+
+        if not np.isfinite(best_loss[anchor_idx]):
+            continue
+
+        if loss != best_key[anchor_idx]:
+            continue
+
+        choice = {
+            group: int(best_choice[group][anchor_idx])
+            for group in groups
+        }
+
+        # Recompute if a selected comparator subject has already been used.
+        if any(
+            choice[group] < 0 or not active[group][choice[group]]
+            for group in groups
+        ):
+            recompute(anchor_idx)
+            continue
+
+        row = {
+            "matched_set_id": len(matched_rows) + 1,
+            "anchor": int(anchor_rows[anchor_idx]),
+        }
+
+        for group in groups:
+            row[group] = int(group_rows[group][choice[group]])
+            row[f"dist_{group}"] = float(best_distance[group][anchor_idx])
+
+        row["loss"] = float(best_loss[anchor_idx])
+        matched_rows.append(row)
+
+        anchor_active[anchor_idx] = False
+        n_active_anchor -= 1
+
+        affected = set()
+
+        for group in groups:
+            active[group][choice[group]] = False
+            affected |= claimants[group][choice[group]]
+
+        release(anchor_idx)
+        affected.discard(anchor_idx)
+
+        if n_active_anchor == 0:
+            break
+
+        # Only anchors using one of the newly assigned comparator subjects
+        # need to have their current best match recomputed. Sorting keeps the
+        # order independent of set iteration order.
+        for i in sorted(affected):
+            if anchor_active[i]:
+                recompute(i)
+
+    matched = build_matched_frame(matched_rows, groups)
+    unmatched_anchor_rows, matching_rate = summarize_matching(
+        matched, anchor_rows
+    )
+
+    return {
+        "matched": matched,
+        "unmatched_anchor_rows": unmatched_anchor_rows,
+        "matching_rate": matching_rate,
+        "max_possible_rate": max_possible_rate(group_rows, anchor_rows),
+    }

@@ -1,0 +1,7 @@
+group_1,group_2,auc
+piperacillin_tazobactam,cefepime,0.47974719908072394
+piperacillin_tazobactam,ceftazidime,0.6027003734559034
+piperacillin_tazobactam,meropenem,0.5722493536340132
+cefepime,ceftazidime,0.6294168342430336
+cefepime,meropenem,0.578569376615915
+ceftazidime,meropenem,0.6756679115196782
